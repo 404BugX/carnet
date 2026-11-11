@@ -41,6 +41,7 @@ DEFAULTS = {
     "fact_char_limit": 500,
     "seat_char_limit": 250,
     "abstention_threshold": 0.55,   # minimum score to inject
+    "recall_floor": 0.34,           # below this coverage, recall says "nothing relevant"
     "cool_after_days": 120,
     "seat_expire_after_days": 90,
     "embed_timeout_ms": 300,
@@ -65,6 +66,7 @@ MEMORY_KEYS = (
     "seat_limit", "seat_char_limit", "fact_char_limit", "max_facts_per_turn",
     "max_sheets_per_turn", "session_fact_limit", "budget_chars_turn",
     "budget_chars_first_turn", "sheet_excerpt_chars", "abstention_threshold",
+    "recall_floor",
 )
 
 NOTE_KEYS = ("max_notes", "expiry_days", "note_char_limit")
@@ -74,6 +76,9 @@ NOTE_BOUNDS = {
     "expiry_days": (1, 365),
     "note_char_limit": (40, 2000),
 }
+
+# Keys that are shares, not counts: they must stay fractional.
+FLOAT_KEYS = {"abstention_threshold", "recall_floor"}
 
 SETTING_BOUNDS = {
     "seat_limit": (1, 200),
@@ -86,6 +91,7 @@ SETTING_BOUNDS = {
     "budget_chars_first_turn": (200, 40000),
     "sheet_excerpt_chars": (40, 4000),
     "abstention_threshold": (0.0, 1.0),
+    "recall_floor": (0.0, 1.0),
 }
 
 
@@ -95,7 +101,7 @@ def normalize_settings(cfg: dict) -> dict:
     for key, (low, high) in SETTING_BOUNDS.items():
         raw = out.get(key, DEFAULTS[key])
         try:
-            value = round(float(raw), 2) if key == "abstention_threshold" else int(float(raw))
+            value = round(float(raw), 3) if key in FLOAT_KEYS else int(float(raw))
         except (TypeError, ValueError):
             value = DEFAULTS[key]
         out[key] = max(low, min(high, value))
@@ -341,6 +347,15 @@ class Carnet:
             self.conn.execute("ALTER TABLE facts ADD COLUMN uses INTEGER NOT NULL DEFAULT 0")
         if "last_used_at" not in cols:
             self.conn.execute("ALTER TABLE facts ADD COLUMN last_used_at TEXT")
+
+        # A note is not always a reminder to execute: it can be a question left
+        # open or a fact to keep in mind until it is confirmed. And without its
+        # originating session, an obscure note cannot be traced back.
+        note_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(notes)")}
+        if note_cols and "kind" not in note_cols:
+            self.conn.execute("ALTER TABLE notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'")
+        if note_cols and "session_id" not in note_cols:
+            self.conn.execute("ALTER TABLE notes ADD COLUMN session_id TEXT")
         fts_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(facts_fts)")}
         if "keywords" not in fts_cols:
             self.conn.execute("DROP TABLE IF EXISTS facts_fts")
@@ -477,24 +492,31 @@ class Carnet:
         return new
 
     # -- temporary notes --------------------------------------------
-    def add_note(self, text: str, expires_at: str) -> dict:
+    def add_note(self, text: str, expires_at: str, kind: str = "fact",
+                 session_id: str = "") -> dict:
         """Create an active note. Expiry is stored, never enforced by deletion."""
         text = (text or "").strip()
         if not text:
             return {"id": None, "error": "empty text"}
+        kind = (kind or "fact").strip().lower()
+        if kind not in ("task", "question", "fact"):
+            kind = "fact"
         nid = _uid("n")
         now = _now()
         self.conn.execute(
-            "INSERT INTO notes(id, text, created_at, expires_at, status) VALUES (?,?,?,?,'active')",
-            (nid, text, now, expires_at),
+            "INSERT INTO notes(id, text, created_at, expires_at, status, kind, session_id)"
+            " VALUES (?,?,?,?,'active',?,?)",
+            (nid, text, now, expires_at, kind, session_id or None),
         )
-        self.log("agent", "note_created", None, {"id": nid, "expires_at": expires_at})
-        return {"id": nid, "created_at": now, "expires_at": expires_at}
+        self.log("agent", "note_created", None,
+                 {"id": nid, "expires_at": expires_at, "kind": kind})
+        return {"id": nid, "created_at": now, "expires_at": expires_at, "kind": kind}
 
     def active_notes(self, limit: int = 8, now: str = "") -> list[sqlite3.Row]:
         """Active notes that have not expired, oldest first."""
         return list(self.conn.execute(
-            "SELECT id, text, created_at, expires_at, status, closed_at FROM notes "
+            "SELECT id, text, created_at, expires_at, status, closed_at, kind, session_id"
+            " FROM notes "
             "WHERE status='active' AND expires_at > ? "
             "ORDER BY created_at ASC, id ASC LIMIT ?",
             (now or _now(), max(0, int(limit))),

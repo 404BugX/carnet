@@ -25,7 +25,7 @@ from typing import Any, Optional
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 
 from .embedder import Embedder
-from .store import DEFAULTS, Carnet, normalize, normalize_settings
+from .store import DEFAULTS, STOPWORDS, Carnet, normalize, normalize_settings
 
 log = logging.getLogger("carnet")
 
@@ -62,7 +62,11 @@ TOOLS = [
         "name": "recall",
         "description": (
             "Searches memory when automatic recall returned nothing, or when you need "
-            "a precise fact before asserting something. Returns identifiers and excerpts."
+            "a precise fact before asserting something. Returns identifiers and excerpts. "
+            "`score` is the share of your own query terms the fact contains (1.0 = every term), "
+            "not a confidence: `weak: true` means less than half of them are there. When nothing "
+            "reaches the floor, the answer is an empty list plus a `nothing relevant` message — "
+            "that means the memory does not know, so say it instead of guessing."
         ),
         "parameters": {
             "type": "object",
@@ -103,12 +107,19 @@ NOTE_TOOLS = [
             "Leaves a temporary note for a future session, for example \"remind me to "
             "discuss X next time\". A note is not a durable fact: it expires after the "
             "configured delay, never enters the core, and is shown once at the start of "
-            "the next session. Use `note_close` when it has been handled."
+            "the next session, with its id. Close it with `note_close(id)` once handled. "
+            "Set `kind` to say what it is: a task to perform, a question left open, or a "
+            "fact to keep in mind until confirmed."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "The note, self-contained and short."},
+                "kind": {
+                    "type": "string",
+                    "enum": ["task", "question", "fact"],
+                    "description": "task = something to do, question = left open for the user, fact = to keep in mind.",
+                },
             },
             "required": ["text"],
         },
@@ -223,6 +234,24 @@ def _first_sentence(fragment: str) -> str:
 
 
 # ---------------------------------------------------------------- provider
+
+def _fix_mojibake(text: str) -> str:
+    """Undo a UTF-8 text that was decoded as CP1252 somewhere upstream.
+
+    The desktop app can hand us text like "Tr\xe2\x88\x9a\xc2\xaes": the bytes are
+    valid UTF-8 read through the wrong table. Repairing here keeps the journal,
+    the vectors and the facts free of it.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    if not any(ord(ch) in (0xC2, 0xC3, 0xE2, 0x80) for ch in text):
+        return text
+    try:
+        repaired = text.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    return repaired if repaired.count("\ufffd") <= text.count("\ufffd") else text
+
 
 def _modern_args(args: dict) -> dict:
     """Accept the pre-1.0 parameter names as aliases.
@@ -357,7 +386,25 @@ class CarnetProvider(MemoryProvider):
         limit = int(self._config["seat_limit"])
         seats = self._store.core(limit)
         date = (self._store.meta_get("core_updated_at", "") or self._store.meta_get("created_at", ""))[:10]
-        lines = [f"[MEMORY — permanent core, {len(seats)}/{limit} seats, as of {date or 'n/a'}]"]
+        counts = {}
+        try:
+            counts = self._store.count()
+        except Exception:
+            counts = {}
+        notes_n = 0
+        try:
+            notes_n = len(self._store.active_notes(limit=500)) if self._config.get("notes_enabled") else 0
+        except Exception:
+            notes_n = 0
+        header = f"[MEMORY — permanent core, {len(seats)}/{limit} seats"
+        if counts.get("facts"):
+            header += f" · {counts['facts']} facts"
+        if counts.get("sheets"):
+            header += f" · {counts['sheets']} sheets"
+        if notes_n:
+            header += f" · {notes_n} notes"
+        header += f", as of {date or 'n/a'}]"
+        lines = [header]
         for s in seats:
             lines.append(f"· {s['text'][: self._config['seat_char_limit']]}")
         if not seats:
@@ -373,6 +420,12 @@ class CarnetProvider(MemoryProvider):
             "repeated in a session."
         )
         lines.append(
+            "Markers in what follows: ✓ certain · ✓? certain but without evidence · "
+            "~ probable · [0] core seat, [1] fact, [2] sheet · each line ends with its id, "
+            "usable with `forget` and `read_fiche`. A score in `recall` is the share of "
+            "your query terms the fact contains, not a confidence in the answer."
+        )
+        lines.append(
             f"Limits: {limit} core seats × {int(self._config['seat_char_limit'])} chars · "
             f"fact max {int(self._config['fact_char_limit'])} chars · "
             f"{int(self._config['max_facts_per_turn'])} facts + "
@@ -384,6 +437,7 @@ class CarnetProvider(MemoryProvider):
 
     # -- reading -----------------------------------------------------
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        query = _fix_mojibake(query)
         sid = session_id or self._session_id
         if not self._store:
             return ""
@@ -399,6 +453,9 @@ class CarnetProvider(MemoryProvider):
             results = self._candidates(query)
             already = self._store.already_injected(sid)
             threshold = float(self._config["abstention_threshold"])
+            has_terms = any(
+                len(w) > 2 and w not in STOPWORDS for w in normalize(query).split()
+            )
 
             # Beyond N facts already injected in the session, only the very relevant
             # are kept: a long session must not end with 70 facts in the context.
@@ -411,6 +468,12 @@ class CarnetProvider(MemoryProvider):
                 row = r["row"]
                 if r["score"] < threshold:
                     break
+                # Relevance before novelty: a fact injected only because it was
+                # never seen costs context at every turn and dilutes the signal.
+                # Skipped on a query made only of stopwords ("ok, merci"), where
+                # no term could ever match.
+                if has_terms and self._coverage(query, row["text"]) <= 0:
+                    continue
                 if row["id"] in already:
                     continue
                 # The core is already in the system prompt: reinjecting it would be a paid duplicate.
@@ -529,7 +592,7 @@ class CarnetProvider(MemoryProvider):
         text = row["text"].replace("\n", " ")
         if len(text) > 220:
             text = text[:217] + "…"
-        return f"[{row['importance']}] {mark} {date} · {text}"
+        return f"[{row['importance']}] {mark} {date} · {row['id']} · {text}"
 
     def _sheet_line(self, row) -> str:
         excerpt = row["text"][: int(self._config["sheet_excerpt_chars"])].replace("\n", " ")
@@ -560,10 +623,15 @@ class CarnetProvider(MemoryProvider):
                 age = 0
             text = (row["text"] or "").replace("\n", " ")[:char_limit]
             if text:
-                lines.append(f"· [{age}d] {text}")
+                kind = (row["kind"] or "fact") if "kind" in row.keys() else "fact"
+                tag = f"({kind}) " if kind in ("task", "question") else ""
+                lines.append(f"· [{age}d · {row['id']}] {tag}{text}")
         if not lines:
             return ""
-        return "\n".join([f"[pending notes · {len(lines)}]", *lines])
+        return "\n".join([
+            f"[pending notes · {len(lines)} — close one with note_close(id) once handled]",
+            *lines,
+        ])
 
     def _health_line(self) -> str:
         try:
@@ -707,10 +775,11 @@ class CarnetProvider(MemoryProvider):
     # -- tools -------------------------------------------------------
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         self._refresh_config()
-        schemas = list(TOOLS)
-        if self._config.get("notes_enabled"):
-            schemas.extend(NOTE_TOOLS)
-        return schemas
+        # `note` is declared even when the layer is off: the runtime builds its
+        # tool registry once at session start, so a schema that only appears
+        # after a settings change is rejected as an unknown tool. Availability is
+        # enforced in the call itself, where the message can explain it.
+        return list(TOOLS) + list(NOTE_TOOLS)
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         if not self._store:
@@ -736,7 +805,7 @@ class CarnetProvider(MemoryProvider):
         return json.dumps({"success": False, "error": f"unknown tool: {tool_name}"}, ensure_ascii=False)
 
     def _tool_remember(self, args: dict) -> str:
-        text = (args.get("text") or "").strip()
+        text = _fix_mojibake((args.get("text") or "").strip())
         if not text:
             return json.dumps({"success": False, "error": "empty text"}, ensure_ascii=False)
         try:
@@ -812,20 +881,64 @@ class CarnetProvider(MemoryProvider):
                               ensure_ascii=False)
         return json.dumps({"success": True, "message": "already known", "id": fid}, ensure_ascii=False)
 
+    def _coverage(self, query: str, text: str) -> float:
+        """Share of the query's own terms the text actually contains.
+
+        This is what the score means in `recall`: not a confidence, not a cosine,
+        but "how much of what you asked for is in this fact". 1.0 is therefore a
+        full lexical match, and it is allowed to be a bad answer to a vague
+        question — which is exactly what the `weak` flag says.
+        """
+        # Plain words only: `query_terms` also emits glued bigrams for FTS, and
+        # those never appear as tokens, which would cap every score below 1.0.
+        words = [w for w in normalize(query).split() if len(w) > 2 and w not in STOPWORDS]
+        if not words:
+            return 0.0
+        body = set(normalize(text).split())
+        hit = sum(1 for w in words if w in body)
+        return round(hit / len(words), 3)
+
     def _tool_recall(self, args: dict) -> str:
-        q = args.get("query") or ""
+        q = _fix_mojibake(args.get("query") or "")
         limit = max(1, min(20, int(args.get("limit", 6) or 6)))
-        res = self._store.search(q, limit=60)[:limit]
-        if not res:
-            return json.dumps({"success": True, "results": [], "message": "nothing found"},
-                              ensure_ascii=False)
+        results = self._candidates(q)
+        ranked = [(self._coverage(q, r["row"]["text"]), r) for r in results]
+        ranked.sort(key=lambda pair: (pair[0], pair[1]["score"]), reverse=True)
+        floor = float(self._config.get("recall_floor", 0.34))
+        best = ranked[0][0] if ranked else 0.0
+
+        # A confident false negative is the worst failure mode for a memory: say
+        # plainly that nothing relevant was found, instead of returning noise.
+        if not ranked or best < floor:
+            return json.dumps({
+                "success": True,
+                "results": [],
+                "coverage": best,
+                "message": (
+                    "nothing relevant"
+                    if ranked else "nothing found"
+                ) + f" — the best match covers {round(best * 100)}% of your query terms",
+            }, ensure_ascii=False)
+
         out = []
-        for r in res:
+        for cov, r in ranked[:limit]:
             row = r["row"]
-            out.append({"id": row["id"], "score": r["score"], "importance": row["importance"],
-                        "confidence": row["confidence"], "date": (row["created_at"] or "")[:10],
-                        "text": row["text"][:400]})
-        return json.dumps({"success": True, "results": out}, ensure_ascii=False)
+            out.append({
+                "id": row["id"],
+                "score": cov,
+                "weak": cov < 0.5,
+                "importance": row["importance"],
+                "confidence": row["confidence"],
+                "date": (row["created_at"] or "")[:10],
+                "text": row["text"][:400],
+            })
+        payload = {"success": True, "count": len(out), "coverage": best, "results": out}
+        if best < 0.5:
+            payload["note"] = (
+                "weak match: the best fact covers less than half of your query terms, "
+                "so the memory may simply not know this. Say so instead of guessing."
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
     def _tool_read(self, args: dict) -> str:
         fid = (args.get("id") or "").strip()
@@ -848,9 +961,12 @@ class CarnetProvider(MemoryProvider):
 
     def _tool_note(self, args: dict) -> str:
         if not self._config.get("notes_enabled"):
-            return json.dumps({"success": False, "error": "notes layer is disabled"},
-                              ensure_ascii=False)
-        text = (args.get("text") or "").strip()
+            return json.dumps({
+                "success": False,
+                "error": "notes layer is disabled",
+                "message": "Temporary notes are off; ask the user to enable them in Carnet > Settings.",
+            }, ensure_ascii=False)
+        text = _fix_mojibake((args.get("text") or "").strip())
         if not text:
             return json.dumps({"success": False, "error": "empty text"}, ensure_ascii=False)
         limit = int(self._config.get("note_char_limit", 300) or 300)
@@ -864,10 +980,12 @@ class CarnetProvider(MemoryProvider):
         days = int(self._config.get("expiry_days", 7) or 7)
         expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).replace(
             microsecond=0).isoformat()
-        res = self._store.add_note(text, expires_at)
+        kind = str(args.get("kind") or "fact").strip().lower()
+        res = self._store.add_note(text, expires_at, kind=kind, session_id=self._session_id)
         if res.get("error"):
             return json.dumps({"success": False, "error": res["error"]}, ensure_ascii=False)
         return json.dumps({"success": True, "message": "note added", "id": res["id"],
+                           "kind": res.get("kind", "fact"),
                            "expires_at": expires_at, "_change": True}, ensure_ascii=False)
 
     def _tool_note_close(self, args: dict) -> str:

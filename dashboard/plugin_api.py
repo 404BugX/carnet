@@ -51,6 +51,7 @@ def _load(name: str, file: Path):
 store = _load("carnet_store", _ROOT / "store.py")
 loc_mod = _load("carnet_loc", _ROOT / "loc.py")
 localmodel = _load("carnet_localmodel", _ROOT / "localmodel.py")
+rephrase_mod = _load("carnet_rephrase", _ROOT / "rephrase.py")
 
 
 def _watch():
@@ -113,7 +114,20 @@ def settings() -> dict:
     payload = _language_payload()
     payload["model_mode"] = _model_values()["mode"]
     payload["notes_enabled"] = bool(_global_config().get("notes_enabled", False))
+    payload["onboarding_done"] = bool(_global_config().get("onboarding_done", False))
     return payload
+
+
+class OnboardingSetting(BaseModel):
+    done: Optional[bool] = None
+
+
+@router.post("/settings/onboarding")
+def set_onboarding(setting: OnboardingSetting) -> dict:
+    """Remember that the guided setup was completed (or dismissed)."""
+    values = {"onboarding_done": bool(setting.done)}
+    _write_global_config(values)
+    return {"done": values["onboarding_done"]}
 
 
 @router.post("/settings/language")
@@ -269,7 +283,7 @@ def download_embedding(consent: DownloadConsent) -> dict:
 
 # ------------------------------------------------------------------ memory settings
 MEMORY_STEPS = {
-    key: (0.01 if key == "abstention_threshold" else 1)
+    key: (0.01 if key in getattr(store, "FLOAT_KEYS", {"abstention_threshold"}) else 1)
     for key in store.MEMORY_KEYS
 }
 
@@ -386,6 +400,34 @@ class ModelSetting(BaseModel):
     url: Optional[str] = None
     model: Optional[str] = None
     api_key: Optional[str] = None
+
+
+@router.post("/settings/model/auto")
+def auto_model() -> dict:
+    """Point the rewrite model at whatever the local server is already serving.
+
+    The guided setup must not ask for a model name: the user who runs LM Studio
+    already has one loaded, and everyone else has nothing to type.
+    """
+    cfg = _model_values()
+    url = cfg["url"] or str(store.DEFAULTS.get("model_url") or "http://127.0.0.1:1234")
+    try:
+        data = rephrase_mod._get_json(url, "/api/v0/models", 3.0)
+    except Exception:
+        raise HTTPException(400, loc_mod.translate("errors.model_server_unreachable"))
+    picked = ""
+    for entry in data.get("data") or []:
+        kind = str(entry.get("type") or "").lower()
+        if kind in ("embeddings", "embedding"):
+            continue
+        picked = str(entry.get("id") or "")
+        if picked:
+            break
+    if not picked:
+        raise HTTPException(400, loc_mod.translate("errors.model_none_loaded"))
+    values = {"model_mode": "lmstudio", "model_url": url, "model_name": picked}
+    _write_global_config(values)
+    return _model_payload()
 
 
 @router.get("/settings/model")
@@ -1218,13 +1260,31 @@ def _graph(influence: float = 0.5) -> Dict[str, Any]:
     }
 
 
-_CACHE: Dict[str, Any] = {"cle": None, "valeur": None}
 
 
 
 
 # ------------------------------------------------------------------ graph
 _GRAPH_CACHE: dict = {"key": None, "value": None}
+
+
+def _db_stamp(db) -> tuple:
+    """Fingerprint of the database *including* its WAL files.
+
+    The main file's mtime barely moves while writes sit in carnet.db-wal, which
+    is the normal state of a WAL database between checkpoints. A cache keyed on
+    that mtime alone serves a stale layout long after new facts were written,
+    which is why a fresh graph can stay empty after a restart.
+    """
+    stamp = []
+    for suffix in ("", "-wal", "-shm"):
+        path = db.parent / (db.name + suffix)
+        try:
+            st = path.stat()
+            stamp.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            stamp.append((0, 0))
+    return tuple(stamp)
 
 
 @router.get("/graph")
@@ -1235,11 +1295,7 @@ def graph(refresh: int = 0, influence: float = 0.5):
     database does not move, and `?refresh=1` forces the recomputation.
     """
     db = _folder() / "carnet.db"
-    try:
-        mtime = db.stat().st_mtime_ns
-    except OSError:
-        mtime = 0
-    key = (mtime, refresh, round(max(0.0, min(1.0, influence)), 3))
+    key = (_db_stamp(db), refresh, round(max(0.0, min(1.0, influence)), 3))
     if not refresh and _GRAPH_CACHE["key"] == key and _GRAPH_CACHE["value"] is not None:
         return _GRAPH_CACHE["value"]
     value = _graph(influence)

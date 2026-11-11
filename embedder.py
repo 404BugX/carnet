@@ -19,6 +19,7 @@ Golden rule: no waiting on the hot path. If the backend is not ready,
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ import select
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from array import array
@@ -60,6 +62,102 @@ def _cosine(a: array, b: array) -> float:
     """Cosine similarity. Both vectors are already normalized at encoding time."""
     return sum(map(mul, a, b))
 
+# -- keep-alive -------------------------------------------------------------
+# Loading the ONNX model takes several seconds. Tying that cost to the provider
+# object meant paying it again at the start of every conversation, so the
+# sidecar now belongs to the whole gateway: one process, shared by every session,
+# released after KEEPALIVE_SECONDS of silence or as soon as the machine runs
+# short on memory.
+KEEPALIVE_SECONDS = 30 * 60
+MEMORY_CEILING_PERCENT = 92.0
+_WATCH_INTERVAL_SECONDS = 60
+
+_RUNTIME: dict = {}
+_RUNTIME_LOCK = threading.Lock()
+_WATCH_STARTED = False
+
+
+def _memory_percent() -> Optional[float]:
+    """Share of physical memory in use, or None when it cannot be read."""
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.virtual_memory().percent)
+    except Exception:
+        pass
+    try:
+        total = os.sysconf("SC_PHYS_PAGES")
+        available = os.sysconf("SC_AVPHYS_PAGES")
+        if total <= 0 or available < 0:
+            return None
+        return max(0.0, min(100.0, (1.0 - available / total) * 100.0))
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _kill_sidecar(proc) -> None:
+    try:
+        if proc.stdin:
+            proc.stdin.write('{"op":"quit"}\n')
+            proc.stdin.flush()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _watch_once() -> None:
+    with _RUNTIME_LOCK:
+        entries = list(_RUNTIME.items())
+    for key, entry in entries:
+        proc = entry.get("proc")
+        if proc is None or proc.poll() is not None:
+            with _RUNTIME_LOCK:
+                _RUNTIME.pop(key, None)
+            continue
+        idle = time.monotonic() - entry.get("touched", 0.0)
+        pressure = _memory_percent()
+        reason = ""
+        if idle >= KEEPALIVE_SECONDS:
+            reason = "idle for {:.0f} min".format(idle / 60)
+        elif pressure is not None and pressure >= MEMORY_CEILING_PERCENT and idle > 60:
+            reason = "memory at {:.0f}%".format(pressure)
+        if not reason:
+            continue
+        log.info("carnet: unloading embedding model (%s)", reason)
+        _kill_sidecar(proc)
+        with _RUNTIME_LOCK:
+            _RUNTIME.pop(key, None)
+
+
+def _ensure_watch() -> None:
+    global _WATCH_STARTED
+    with _RUNTIME_LOCK:
+        if _WATCH_STARTED:
+            return
+        _WATCH_STARTED = True
+
+    def loop() -> None:
+        while True:
+            time.sleep(_WATCH_INTERVAL_SECONDS)
+            try:
+                _watch_once()
+            except Exception as exc:
+                log.warning("carnet: embedding watchdog: %s", exc)
+
+    threading.Thread(target=loop, name="carnet-embed-watch", daemon=True).start()
+
+    # A warm sidecar must never outlive the gateway that owns it.
+    def _release_all() -> None:
+        for entry in list(_RUNTIME.values()):
+            proc = entry.get("proc")
+            if proc is not None and proc.poll() is None:
+                _kill_sidecar(proc)
+
+    atexit.register(_release_all)
+
 
 class Embedder:
     def __init__(self, db: Path, server: Path, python: str = "", timeout_ms: int = 300,
@@ -81,6 +179,9 @@ class Embedder:
         self._state = {"dim": 0, "n": 0}
         self._cache: dict[str, array] = {}
         self._cache_loaded = False
+        # One sidecar per database *and* model: two profiles sharing a gateway
+        # must not adopt each other's vectors.
+        self._key = (str(self.model_dir or ""), str(self.db))
 
     # -- lifecycle ---------------------------------------------------
     @property
@@ -95,6 +196,8 @@ class Embedder:
         """Prepare the backend without blocking the provider's initialization."""
         if self.backend == "disabled":
             return
+        if self.backend == "sidecar" and self._adopt():
+            return
         targets = {
             "lmstudio": self._start_lmstudio,
             "custom": self._start_custom,
@@ -103,24 +206,53 @@ class Embedder:
         target = targets.get(self.backend, self._start_lmstudio)
         threading.Thread(target=target, name="carnet-embed-start", daemon=True).start()
 
-    def stop(self) -> None:
+    def stop(self, force: bool = False) -> None:
+        """Let go of the model without paying for it twice.
+
+        Session teardown calls this, and the next session would have to reload
+        the whole ONNX graph. The process therefore stays warm and is released by
+        the watchdog instead, on silence or memory pressure.
+        """
         if self.backend != "sidecar":
             return
+        self._ready.clear()
+        if not force:
+            with _RUNTIME_LOCK:
+                entry = _RUNTIME.get(self._key)
+            if entry is not None and entry.get("proc") is not None and entry["proc"].poll() is None:
+                entry["touched"] = time.monotonic()
+                self.proc = None
+                return
         p = self.proc
         self.proc = None
-        self._ready.clear()
-        if not p:
-            return
-        try:
-            if p.stdin:
-                p.stdin.write('{"op":"quit"}\n')
-                p.stdin.flush()
-            p.wait(timeout=2)
-        except Exception:
-            try:
-                p.kill()
-            except Exception:
-                pass
+        with _RUNTIME_LOCK:
+            _RUNTIME.pop(self._key, None)
+        if p:
+            _kill_sidecar(p)
+
+    def _adopt(self) -> bool:
+        """Reuse the sidecar already running for this database and model."""
+        _ensure_watch()
+        with _RUNTIME_LOCK:
+            entry = _RUNTIME.get(self._key)
+        if not entry:
+            return False
+        proc = entry.get("proc")
+        if proc is None or proc.poll() is not None:
+            with _RUNTIME_LOCK:
+                _RUNTIME.pop(self._key, None)
+            return False
+        self.proc = proc
+        self._state = dict(entry.get("state") or {"dim": 0, "n": 0})
+        entry["touched"] = time.monotonic()
+        self._ready.set()
+        return True
+
+    def _touch(self) -> None:
+        with _RUNTIME_LOCK:
+            entry = _RUNTIME.get(self._key)
+        if entry is not None:
+            entry["touched"] = time.monotonic()
 
     def _endpoint(self, suffix: str) -> str:
         """Accept a base URL, a /v1 URL or a full endpoint URL."""
@@ -205,6 +337,13 @@ class Embedder:
             rep = json.loads(line) if line.strip() else {}
             if rep.get("ok"):
                 self._state = {"dim": rep.get("dim", 0), "n": rep.get("n", 0)}
+                _ensure_watch()
+                with _RUNTIME_LOCK:
+                    _RUNTIME[self._key] = {
+                        "proc": self.proc,
+                        "touched": time.monotonic(),
+                        "state": dict(self._state),
+                    }
                 self._ready.set()
             else:
                 self._error = "invalid startup response"
@@ -225,6 +364,7 @@ class Embedder:
                 if not r:
                     return {"ok": False, "error": "timeout"}
                 line = p.stdout.readline()
+                self._touch()
                 return json.loads(line) if line.strip() else {"ok": False, "error": "empty response"}
             except Exception as exc:
                 return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

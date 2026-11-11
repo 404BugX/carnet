@@ -20,6 +20,10 @@ const ID = 'carnet'
 let _ctx = null
 
 const tab$ = atom('facts')
+// The page ships with the app; the Python half is installed per profile. In a
+// profile without it every call answers 404, so the page must say so instead of
+// showing an empty memory.
+const backendMissing$ = atom(false)
 const search$ = atom('')
 const filter$ = atom('all')
 const sort$ = atom('recent')
@@ -72,6 +76,17 @@ const LEVEL = { 0: 'dashboard.levels.core', 1: 'dashboard.levels.fact', 2: 'dash
 
 function labelled(items) {
   return items.map((x) => ({ id: x.id, label: t(x.label) }))
+}
+
+async function probeBackend() {
+  try {
+    const settings = await api('/settings')
+    backendMissing$.set(false)
+    return settings
+  } catch (_) {
+    backendMissing$.set(true)
+    return null
+  }
 }
 
 function api(path, opts) {
@@ -1418,7 +1433,7 @@ function AboutView() {
   const languages = (data.languages || []).map((code) => t(`dashboard.settings.language_${code}`)).join(', ')
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col gap-3 overflow-y-auto',
-    children: jsxs('div', {
+    children: [jsxs('div', {
       className: 'flex flex-col',
       children: [
         jsx(Row, { label: t('dashboard.about.name'), value: data.name }),
@@ -1430,7 +1445,25 @@ function AboutView() {
         jsx(Row, { label: t('dashboard.about.repository'), value: data.repository || t('dashboard.about.repository_soon') }),
         jsx(Row, { label: t('dashboard.about.languages'), value: languages })
       ]
-    })
+    }), jsxs('div', {
+      className: 'flex flex-col gap-1.5 pt-1',
+      children: [
+        jsx(Button, {
+          size: 'sm', variant: 'outline',
+          onClick: async () => {
+            try {
+              await api('/settings/onboarding', { method: 'POST', body: { done: false } })
+              obClearDraft()
+              obDraft$.set({ ...OB_DRAFT_DEFAULT })
+              tab$.set('facts')
+              await refresh()
+            } catch (e) { notifyError(e, t('errors.settings_failed')) }
+          },
+          children: t('dashboard.about.restart_onboarding')
+        }),
+        jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: t('dashboard.about.restart_onboarding_hint') })
+      ]
+    })]
   })
 }
 
@@ -3094,7 +3127,6 @@ function PanneauDetail({ ouvert, graphe }) {
       jsxs('div', {
         className: 'flex shrink-0 flex-wrap gap-1.5 pt-1',
         children: [
-          jsx(Button, { size: 'sm', variant: 'outline', onClick: () => host.navigate('/carnet'), children: t('dashboard.graph.open_carnet') }),
           jsx(Button, { size: 'sm', variant: 'ghost', onClick: () => centrerSur(detail.id, graphe), children: t('dashboard.graph.recenter') }),
           jsx(Button, {
             size: 'sm', variant: 'ghost',
@@ -3144,7 +3176,6 @@ function GraphsView() {
           jsxs('div', {
             className: 'flex items-center gap-1.5',
             children: [
-              jsx(Button, { size: 'sm', variant: 'ghost', onClick: () => host.navigate('/carnet'), children: t('dashboard.graph.open_carnet') }),
               jsx(Button, {
                 size: 'sm', variant: reglages ? 'outline' : 'ghost',
                 onClick: () => reglages$.set(!reglages$.get()),
@@ -3202,12 +3233,423 @@ function GraphsView() {
 
 
 // ── Page ────────────────────────────────────────────────────────────────────
+// ── Onboarding ──────────────────────────────────────────────────────────────
+// One question per screen. A single stacked form would be shorter to write and
+// much worse to use: the user cannot tell what matters. Seven short steps, a
+// progress bar, Back and Skip everywhere, and nothing here is final — every
+// answer stays editable in Settings.
+const ONBOARD_STEPS = ['welcome', 'language', 'embedding', 'model', 'memory', 'notes', 'finish']
+
+// The wizard's progress lives outside the component, and outside the JS module
+// as well: changing the interface language replays the plugin bundle, so both a
+// useState and a plain module variable send the user back to the first screen.
+// sessionStorage is the only thing that survives that reload.
+const OB_DRAFT_DEFAULT = { step: 0, language: '', embedding: 'local', embedUrl: '', embedModel: '', model: 'off', notes: true }
+const OB_DRAFT_KEY = 'carnet-onboarding-draft'
+
+function obLoadDraft() {
+  try {
+    const raw = sessionStorage.getItem(OB_DRAFT_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+    if (parsed && typeof parsed === 'object') return { ...OB_DRAFT_DEFAULT, ...parsed }
+  } catch (_) {}
+  return { ...OB_DRAFT_DEFAULT }
+}
+
+function obSaveDraft(draft) {
+  try { sessionStorage.setItem(OB_DRAFT_KEY, JSON.stringify(draft)) } catch (_) {}
+}
+
+function obClearDraft() {
+  try { sessionStorage.removeItem(OB_DRAFT_KEY) } catch (_) {}
+}
+
+const obDraft$ = atom(obLoadDraft())
+
+function ObChoice({ active, title, hint, warn, onClick }) {
+  return jsxs('button', {
+    type: 'button',
+    onClick,
+    className: 'carnet-ob-choice' + (active ? ' is-active' : '') + (warn ? ' is-warn' : ''),
+    children: [
+      jsxs('div', {
+        className: 'carnet-ob-choice-head',
+        children: [
+          jsx('span', { className: 'carnet-ob-choice-title', children: title }),
+          warn ? jsx('span', { className: 'carnet-ob-warn', children: t('onboarding.embedding.warning') }) : null,
+          jsx('span', { className: 'carnet-ob-dot' + (active ? ' is-on' : '') })
+        ]
+      }),
+      hint ? jsx('span', { className: 'carnet-ob-choice-hint', children: hint }) : null
+    ]
+  })
+}
+
+function Onboarding() {
+  const tick = useValue(tick$)
+  const { data: settings } = useQuery({ queryKey: ['carnet', 'settings', tick], queryFn: () => api('/settings'), staleTime: 0 })
+  const { data: emb } = useQuery({ queryKey: ['carnet', 'embedding', tick], queryFn: () => api('/settings/embedding'), staleTime: 0 })
+  const { data: mem } = useQuery({ queryKey: ['carnet', 'memory-settings', tick], queryFn: () => api('/settings/memory'), staleTime: 0 })
+  const { data: modelCfg } = useQuery({ queryKey: ['carnet', 'model-settings', tick], queryFn: () => api('/settings/model'), staleTime: 0 })
+  const draft = useValue(obDraft$)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const { step, language, embedding, model, notes } = draft
+  const patch = (values) => {
+    const next = { ...draft, ...values }
+    obSaveDraft(next)
+    obDraft$.set(next)
+    return next
+  }
+
+  const chooseLanguage = async (code) => {
+    patch({ language: code })
+    try {
+      await api('/settings/language', { method: 'POST', body: { language: code } })
+      await refresh()
+    } catch (_) {}
+  }
+  const setStep = (n) => patch({ step: n })
+
+  useEffect(() => {
+    if (settings && !draft.language) patch({ language: settings.language || 'en' })
+  }, [settings, draft.language])
+
+  const local = (emb && emb.local) || { state: 'absent', percent: 0 }
+  // Turning the rephrase model on means pointing it at a real model name. If the
+  // user never configured one, the honest answer is "not yet", not a guess.
+  const modelReady = !!(modelCfg && modelCfg.mode !== 'off' && modelCfg.model)
+  useEffect(() => {
+    if (local.state !== 'downloading') return undefined
+    const id = setInterval(() => { void refresh() }, 1500)
+    return () => clearInterval(id)
+  }, [local.state])
+
+  const current = ONBOARD_STEPS[step]
+  const total = ONBOARD_STEPS.length - 1
+  const pct = Math.round(100 * step / total)
+
+  async function commit(next) {
+    setError('')
+    setBusy(true)
+    try {
+      if (current === 'embedding') {
+        if (embedding === 'custom' && (!draft.embedUrl.trim() || !draft.embedModel.trim())) {
+          setError(t('onboarding.embedding.need_fields'))
+          setBusy(false)
+          return
+        }
+        const body = embedding === 'custom'
+          ? { mode: 'custom', url: draft.embedUrl.trim(), model: draft.embedModel.trim() }
+          : { mode: embedding }
+        await api('/settings/embedding', { method: 'POST', body })
+      } else if (current === 'model') {
+        if (model === 'off') await api('/settings/model', { method: 'POST', body: { mode: 'off' } })
+      } else if (current === 'notes') {
+        await api('/settings/notes', { method: 'POST', body: { enabled: notes } })
+      }
+    } catch (e) {
+      setError(String((e && e.message) || e))
+      setBusy(false)
+      return
+    }
+    setBusy(false)
+    setStep(next)
+    if (current === 'embedding') await refresh()
+  }
+
+  const close = async () => {
+    // The language is applied last on purpose: switching it replays the plugin
+    // bundle, and doing that mid-flow restarts the wizard from screen one.
+    const chosen = obLoadDraft().language
+    if (chosen && settings && chosen !== settings.language) {
+      try {
+        await api('/settings/language', { method: 'POST', body: { language: chosen } })
+      } catch (_) {}
+    }
+    obClearDraft()
+    obDraft$.set({ ...OB_DRAFT_DEFAULT })
+    try {
+      await api('/settings/onboarding', { method: 'POST', body: { done: true } })
+    } catch (e) {
+      notifyError(e, t('errors.settings_failed'))
+    }
+    await refresh()
+  }
+
+  const pickModel = async () => {
+    if (modelReady) { patch({ model: 'on' }); return }
+    setError('')
+    setBusy(true)
+    try {
+      await api('/settings/model/auto', { method: 'POST', body: {} })
+      patch({ model: 'on' })
+      await refresh()
+    } catch (e) {
+      setError(t('onboarding.model.no_server'))
+    }
+    setBusy(false)
+  }
+
+  const downloadLocal = async () => {
+    setError('')
+    setBusy(true)
+    try {
+      await api('/settings/embedding/download', { method: 'POST', body: { consent: true }, timeoutMs: 30000 })
+      await refresh()
+    } catch (e) {
+      setError(String((e && e.message) || e))
+    }
+    setBusy(false)
+  }
+
+  const embedOptions = [
+    ['local', t('onboarding.embedding.local'), t('onboarding.embedding.local_hint')],
+    ['lmstudio', t('onboarding.embedding.lmstudio'), t('onboarding.embedding.lmstudio_hint')],
+    ['custom', t('onboarding.embedding.custom'), t('onboarding.embedding.custom_hint')],
+    ['disabled', t('onboarding.embedding.disabled'), t('onboarding.embedding.disabled_hint')]
+  ]
+
+  const languages = (settings && settings.languages) || ['en', 'fr']
+
+  let body = null
+  if (current === 'welcome') {
+    body = jsxs('div', {
+      className: 'carnet-ob-center',
+      children: [
+        jsx('h1', { className: 'carnet-ob-title', children: t('onboarding.welcome.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.welcome.body') }),
+        jsxs('div', {
+          className: 'carnet-ob-layers',
+          children: [
+            jsx('div', { className: 'carnet-ob-layer', children: t('onboarding.welcome.layer_core') }),
+            jsx('div', { className: 'carnet-ob-layer', children: t('onboarding.welcome.layer_facts') }),
+            jsx('div', { className: 'carnet-ob-layer', children: t('onboarding.welcome.layer_sheets') })
+          ]
+        }),
+        jsx('p', { className: 'carnet-ob-promise', children: t('onboarding.welcome.promise') }),
+        jsx(Button, { className: 'carnet-ob-cta', onClick: () => commit(1), children: t('onboarding.continue') }),
+        jsx('button', {
+          type: 'button',
+          className: 'carnet-ob-skip',
+          onClick: close,
+          children: t('onboarding.welcome.skip_hint')
+        })
+      ]
+    })
+  } else if (current === 'language') {
+    body = jsxs('div', {
+      className: 'carnet-ob-stack',
+      children: [
+        jsx('h2', { className: 'carnet-ob-title', children: t('onboarding.language.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.language.body', { count: languages.length }) }),
+        jsx('div', {
+          className: 'carnet-ob-grid',
+          children: languages.map((code) => jsx(ObChoice, {
+            active: language === code,
+            title: String(code).toUpperCase(),
+            hint: null,
+            onClick: () => { void chooseLanguage(code) }
+          }, code))
+        })
+      ]
+    })
+  } else if (current === 'embedding') {
+    body = jsxs('div', {
+      className: 'carnet-ob-stack',
+      children: [
+        jsx('h2', { className: 'carnet-ob-title', children: t('onboarding.embedding.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.embedding.body') }),
+        jsx('div', {
+          className: 'carnet-ob-stack-tight',
+          children: embedOptions.map(([key, title, hint]) => jsx(ObChoice, {
+            active: embedding === key,
+            title,
+            hint,
+            warn: key === 'disabled',
+            onClick: () => patch({ embedding: key })
+          }, key))
+        }),
+        embedding === 'custom' ? jsxs('div', {
+          className: 'carnet-ob-fields',
+          children: [
+            jsx(Field, {
+              label: t('onboarding.embedding.url'), value: draft.embedUrl,
+              onChange: (url) => patch({ embedUrl: url }), placeholder: 'http://127.0.0.1:1234/v1'
+            }),
+            jsx(Field, {
+              label: t('onboarding.embedding.model'), value: draft.embedModel,
+              onChange: (model) => patch({ embedModel: model }), placeholder: 'text-embedding-embeddinggemma-300m'
+            })
+          ]
+        }) : null,
+        embedding === 'local' ? jsxs('div', {
+          className: 'carnet-ob-download',
+          children: [
+            local.state === 'ready'
+              ? jsx(Badge, { children: t('onboarding.embedding.ready') })
+              : jsx(Button, {
+                  size: 'sm',
+                  variant: 'outline',
+                  disabled: busy || local.state === 'downloading',
+                  onClick: downloadLocal,
+                  children: local.state === 'downloading'
+                    ? t('onboarding.embedding.downloading', { percent: Math.round(local.percent || 0) })
+                    : t('onboarding.embedding.download')
+                }),
+            local.state === 'downloading' || (local.state === 'ready' ? false : true)
+              ? jsx('div', {
+                  className: 'carnet-ob-bar',
+                  children: jsx('i', { style: { width: Math.max(2, Math.round(local.percent || 0)) + '%' } })
+                })
+              : null
+          ]
+        }) : null
+      ]
+    })
+  } else if (current === 'model') {
+    body = jsxs('div', {
+      className: 'carnet-ob-stack',
+      children: [
+        jsx('h2', { className: 'carnet-ob-title', children: t('onboarding.model.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.model.body') }),
+        jsx('div', {
+          className: 'carnet-ob-grid',
+          children: [
+            jsx(ObChoice, { active: model === 'off', title: t('onboarding.model.off_label'), hint: t('onboarding.model.off_hint'), onClick: () => patch({ model: 'off' }) }, 'off'),
+            jsx(ObChoice, {
+              active: model === 'on',
+              title: t('onboarding.model.on_label'),
+              hint: modelReady ? t('onboarding.model.on_hint') : t('onboarding.model.auto_hint'),
+              onClick: pickModel
+            }, 'on')
+          ]
+        })
+      ]
+    })
+  } else if (current === 'memory') {
+    const fields = (mem && mem.fields) || []
+    const pick = (key) => {
+      const f = fields.filter((x) => x.key === key)[0]
+      return f ? f.value : null
+    }
+    body = jsxs('div', {
+      className: 'carnet-ob-stack',
+      children: [
+        jsx('h2', { className: 'carnet-ob-title', children: t('onboarding.memory.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.memory.body') }),
+        jsxs('div', {
+          className: 'carnet-ob-summary',
+          children: [
+            jsxs('div', { className: 'carnet-ob-sum-row', children: [
+              jsx('span', { children: t('onboarding.memory.seats') }),
+              jsx('strong', { children: String(pick('seat_limit') == null ? '25' : pick('seat_limit')) })
+            ]}),
+            jsxs('div', { className: 'carnet-ob-sum-row', children: [
+              jsx('span', { children: t('onboarding.memory.facts_per_turn') }),
+              jsx('strong', { children: String(pick('max_facts_per_turn') == null ? '14' : pick('max_facts_per_turn')) })
+            ]}),
+            jsxs('div', { className: 'carnet-ob-sum-row', children: [
+              jsx('span', { children: t('onboarding.memory.budget') }),
+              jsx('strong', { children: String(pick('budget_chars_turn') == null ? '2400' : pick('budget_chars_turn')) })
+            ]})
+          ]
+        }),
+        jsx('p', { className: 'carnet-ob-note', children: t('onboarding.memory.hint') })
+      ]
+    })
+  } else if (current === 'notes') {
+    body = jsxs('div', {
+      className: 'carnet-ob-stack',
+      children: [
+        jsx('h2', { className: 'carnet-ob-title', children: t('onboarding.notes.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.notes.body') }),
+        jsx('div', {
+          className: 'carnet-ob-grid',
+          children: [
+            jsx(ObChoice, { active: notes, title: t('onboarding.notes.on_label'), hint: t('onboarding.notes.on_hint'), onClick: () => patch({ notes: true }) }, 'on'),
+            jsx(ObChoice, { active: !notes, title: t('onboarding.notes.off_label'), hint: t('onboarding.notes.off_hint'), onClick: () => patch({ notes: false }) }, 'off')
+          ]
+        })
+      ]
+    })
+  } else {
+    body = jsxs('div', {
+      className: 'carnet-ob-center',
+      children: [
+        jsx('h1', { className: 'carnet-ob-title', children: t('onboarding.finish.title') }),
+        jsx('p', { className: 'carnet-ob-lead', children: t('onboarding.finish.body') }),
+        jsx(Button, { className: 'carnet-ob-cta', disabled: busy, onClick: close, children: t('onboarding.finish.go') })
+      ]
+    })
+  }
+
+  return jsxs('div', {
+    className: 'carnet-ob',
+    children: [
+      jsx('div', { className: 'carnet-ob-content', children: body }),
+      error ? jsx('div', { className: 'carnet-ob-error', children: error }) : null,
+      current === 'welcome' ? null : jsxs('div', {
+        className: 'carnet-ob-foot',
+        children: [
+          jsx('div', {
+            className: 'carnet-ob-progress',
+            children: jsx('i', { style: { width: Math.max(4, pct) + '%' } })
+          }),
+          jsxs('div', {
+            className: 'carnet-ob-foot-row',
+            children: [
+              jsx(Button, { size: 'sm', variant: 'ghost', disabled: busy || step === 0, onClick: () => setStep(Math.max(0, step - 1)), children: t('onboarding.back') }),
+              jsx('span', { className: 'carnet-ob-count', children: t('onboarding.progress', { current: step, total }) }),
+              current === 'finish'
+                ? jsx(Button, { size: 'sm', disabled: busy, onClick: close, children: t('onboarding.finish.go') })
+                : jsx(Button, { size: 'sm', disabled: busy, onClick: () => commit(step + 1), children: t('onboarding.continue') }),
+              jsx('button', { type: 'button', className: 'carnet-ob-skip', onClick: close, children: t('onboarding.skip') })
+            ]
+          })
+        ]
+      })
+    ]
+  })
+}
+
+function BackendMissing() {
+  return jsxs('div', {
+    className: 'carnet-ob',
+    children: jsx('div', {
+      className: 'carnet-ob-content',
+      children: jsxs('div', {
+        className: 'carnet-ob-center',
+        children: [
+          jsx('h1', { className: 'carnet-ob-title', children: 'Carnet is not enabled in this profile' }),
+          jsx('p', { className: 'carnet-ob-lead', children: 'The interface is installed for the whole app, but the memory itself lives inside a profile. This one does not have it yet, so every request comes back empty.' }),
+          jsx('pre', { className: 'carnet-ob-cmd', children: 'hermes -p <profile> plugins install carnet' }),
+          jsx('p', { className: 'carnet-ob-lead', children: 'Run it in a terminal with the profile name, then retry. Without a profile name it targets the default one.' }),
+          jsx(Button, {
+            className: 'carnet-ob-cta',
+            onClick: async () => { await probeBackend(); await refresh() },
+            children: 'Retry'
+          })
+        ]
+      })
+    })
+  })
+}
+
 function CarnetPage() {
   const tab = useValue(tab$)
   const tick = useValue(tick$)
   const { data: settings } = useQuery({
     queryKey: ['carnet', 'settings', tick], queryFn: () => api('/settings'), staleTime: 0
   })
+  const missing = useValue(backendMissing$)
+  if (missing) return jsx(BackendMissing, {})
+  if (settings && !settings.onboarding_done) {
+    return jsx('div', {
+      className: 'flex h-full min-h-0 flex-col p-4',
+      children: jsx(Onboarding, {})
+    })
+  }
   const notesOn = !!(settings && settings.notes_enabled)
   const tabs = notesOn ? TABS : TABS.filter((x) => x.id !== 'notes')
   const views = { facts: FactsView, notes: NotesView, core: CoreView, watch: WatchView, injections: InjectionsView, graphs: GraphsView, stats: StatsView, settings: SettingsView, about: AboutView }
@@ -3525,6 +3967,248 @@ textarea.carnet-input { min-height: 3rem; resize: vertical; }
 }
 .carnet-status svg { flex: none; }
 .carnet-status-count { color: var(--ui-text-tertiary, #9a9aa2); }
+
+/* Onboarding: one question per screen, a lot of air, one main action. */
+.carnet-ob {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.carnet-ob-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  padding: 2rem 1rem 1rem;
+}
+.carnet-ob-center {
+  margin: auto;
+  max-width: 34rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.9rem;
+}
+.carnet-ob-stack {
+  margin: auto;
+  width: 100%;
+  max-width: 34rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+.carnet-ob-stack-tight {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.carnet-ob-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--ui-text-primary, #f2f2f4);
+  letter-spacing: -0.01em;
+}
+.carnet-ob-lead {
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  color: var(--ui-text-secondary, #b3b3bb);
+}
+.carnet-ob-layers {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.25rem 0;
+}
+.carnet-ob-layer {
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--stroke-nous, rgb(255 255 255 / 7%));
+  border-radius: 0.5rem;
+  background: var(--surface-raised, rgb(255 255 255 / 2%));
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--ui-text-secondary, #b3b3bb);
+  text-align: left;
+}
+.carnet-ob-promise {
+  font-size: 0.75rem;
+  color: var(--ui-text-tertiary, #8a8a93);
+}
+.carnet-ob-cmd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--stroke-nous, rgb(255 255 255 / 8%));
+  background: var(--surface-raised, rgb(255 255 255 / 2%));
+  color: var(--ui-text-primary, #f2f2f4);
+  user-select: all;
+}
+.carnet-ob-cta {
+  min-width: 11rem;
+  justify-content: center;
+  padding-left: 1.5rem;
+  padding-right: 1.5rem;
+}
+.carnet-ob-skip {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: 0.6875rem;
+  color: var(--ui-text-tertiary, #8a8a93);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.carnet-ob-skip:hover { color: var(--ui-text-secondary, #b3b3bb); }
+.carnet-ob-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem;
+}
+.carnet-ob-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.6rem 0.7rem;
+  text-align: left;
+  border: 1px solid var(--stroke-nous, rgb(255 255 255 / 7%));
+  border-radius: 0.5rem;
+  background: var(--surface-raised, rgb(255 255 255 / 2%));
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.carnet-ob-choice:hover { border-color: var(--stroke-strong, rgb(255 255 255 / 16%)); }
+.carnet-ob-choice.is-active {
+  border-color: var(--accent, #6ee7a8);
+  background: color-mix(in srgb, var(--accent, #6ee7a8) 8%, transparent);
+}
+.carnet-ob-choice-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.carnet-ob-choice-title {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--ui-text-primary, #f2f2f4);
+}
+.carnet-ob-choice-hint {
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  color: var(--ui-text-tertiary, #8a8a93);
+}
+.carnet-ob-warn {
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ui-warning, #e0a458);
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0.05rem 0.35rem;
+  opacity: 0.9;
+  flex: 0 0 auto;
+}
+.carnet-ob-choice.is-warn { border-color: color-mix(in srgb, var(--ui-warning, #e0a458) 45%, transparent); }
+.carnet-ob-choice.is-warn .carnet-ob-choice-hint { color: color-mix(in srgb, var(--ui-warning, #e0a458) 75%, var(--ui-text-tertiary, #8a8a93)); }
+.carnet-ob-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--stroke-strong, rgb(255 255 255 / 22%));
+  flex: 0 0 auto;
+}
+.carnet-ob-dot.is-on {
+  border-color: var(--accent, #6ee7a8);
+  background: var(--accent, #6ee7a8);
+}
+.carnet-ob-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.carnet-ob-field-label {
+  font-size: 0.6875rem;
+  color: var(--ui-text-tertiary, #8a8a93);
+}
+.carnet-ob-download {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-top: 0.15rem;
+}
+.carnet-ob-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--stroke-nous, rgb(255 255 255 / 8%));
+  overflow: hidden;
+}
+.carnet-ob-bar i,
+.carnet-ob-progress i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent, #6ee7a8);
+  transition: width 200ms ease;
+}
+.carnet-ob-summary {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--stroke-nous, rgb(255 255 255 / 7%));
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.carnet-ob-sum-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  color: var(--ui-text-secondary, #b3b3bb);
+}
+.carnet-ob-sum-row + .carnet-ob-sum-row {
+  border-top: 1px solid var(--stroke-nous, rgb(255 255 255 / 6%));
+}
+.carnet-ob-sum-row strong {
+  font-weight: 500;
+  color: var(--ui-text-primary, #f2f2f4);
+  font-variant-numeric: tabular-nums;
+}
+.carnet-ob-note {
+  font-size: 0.6875rem;
+  color: var(--ui-text-tertiary, #8a8a93);
+}
+.carnet-ob-foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+}
+.carnet-ob-progress {
+  height: 2px;
+  border-radius: 999px;
+  background: var(--stroke-nous, rgb(255 255 255 / 8%));
+  overflow: hidden;
+}
+.carnet-ob-foot-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.carnet-ob-count {
+  flex: 1 1 auto;
+  font-size: 0.6875rem;
+  color: var(--ui-text-tertiary, #8a8a93);
+}
+.carnet-ob-error {
+  padding: 0 1rem 0.5rem;
+  font-size: 0.75rem;
+  color: var(--ui-danger, #f87171);
+}
 `
 
 function mountStylesheet() {
@@ -3552,11 +4236,9 @@ export default {
     _ctx = ctx
     mountStylesheet()
     await loadStrings().catch(() => {})
-    try {
-      const settings = await api('/settings')
+    const settings = await probeBackend()
+    if (settings) {
       modelMode$.set(['custom', 'lmstudio'].includes(settings.model_mode) ? settings.model_mode : 'off')
-    } catch (e) {
-      // The page still registers; the chip stays off until the backend answers.
     }
     return ctx.registerMany([
       { id: 'page', area: ROUTES_AREA, data: { path: '/carnet' }, render: () => jsx(CarnetPage, {}) },

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carnet"
-version = "0.9.0"
+version = "0.9.1"
 description = "Four-layer memory provider for Hermes: permanent core, facts recalled on demand, sheets read only when needed."
 readme = "README.md"
 license = { text = "MIT" }

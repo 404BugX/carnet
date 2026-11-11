@@ -1,5 +1,5 @@
 name: carnet
-version: 0.9.0
+version: 0.9.1
 author: "404BugX"
 repository: "https://github.com/404BugX/carnet"
 description: "Four-layer memory: permanent core, facts recalled on demand, sheets read only when needed."

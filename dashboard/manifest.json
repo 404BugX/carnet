@@ -3,6 +3,6 @@
   "label": "Carnet",
   "description": "Memory facts, core layer, background pass, open questions. Read and edit the store directly.",
   "icon": null,
-  "version": "0.1.0",
+  "version": "0.9.1",
   "api": "plugin_api.py"
 }
