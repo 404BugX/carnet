@@ -207,6 +207,21 @@ def _write_runtime_config(values: dict) -> None:
     data.update(values)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # The file can hold an endpoint key: keep it readable by its owner only.
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _clean_setting(value) -> str:
+    """Drop the "[object Object]" a bad input binding may have saved.
+
+    Older builds stored a change event instead of its text; those values are
+    unusable and must not be shown as if the user had typed them.
+    """
+    text = str(value or "").strip()
+    return "" if "[object Object]" in text else text
 
 
 def _embedding_mode(cfg: dict) -> str:
@@ -220,8 +235,8 @@ def _embedding_payload() -> dict:
     cfg = _runtime_config()
     return {
         "mode": _embedding_mode(cfg),
-        "url": str(cfg.get("embed_url") or ""),
-        "model": str(cfg.get("embed_model") or ""),
+        "url": _clean_setting(cfg.get("embed_url")),
+        "model": _clean_setting(cfg.get("embed_model")),
         "api_key_set": bool(str(cfg.get("embed_api_key") or "").strip()),
         "local": localmodel.status(_HOME),
     }
@@ -259,8 +274,8 @@ def set_embedding(setting: EmbeddingSetting) -> dict:
             embed_model=(setting.model or "").strip() or EMBED_DEFAULT_MODEL,
         )
     elif mode == "custom":
-        url = (setting.url or "").strip()
-        model = (setting.model or "").strip()
+        url = _clean_setting(setting.url)
+        model = _clean_setting(setting.model)
         if not url.startswith(("http://", "https://")):
             raise HTTPException(400, loc_mod.translate("errors.embedding_url"))
         if not model:
@@ -389,8 +404,8 @@ def _model_payload() -> dict:
     cfg = _model_values()
     return {
         "mode": cfg["mode"],
-        "url": cfg["url"],
-        "model": cfg["model"],
+        "url": _clean_setting(cfg["url"]),
+        "model": _clean_setting(cfg["model"]),
         "api_key_set": bool(cfg["api_key"].strip()),
     }
 
@@ -442,8 +457,8 @@ def set_model(setting: ModelSetting) -> dict:
         raise HTTPException(400, loc_mod.translate("errors.model_mode"))
     values: dict = {"model_mode": mode}
     if mode in ("custom", "lmstudio"):
-        url = (setting.url or "").strip()
-        model = (setting.model or "").strip()
+        url = _clean_setting(setting.url)
+        model = _clean_setting(setting.model)
         if mode == "lmstudio" and not url:
             url = str(store.DEFAULTS["embed_url"])
         if not url.startswith(("http://", "https://")):

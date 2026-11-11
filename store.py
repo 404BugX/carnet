@@ -42,14 +42,11 @@ DEFAULTS = {
     "seat_char_limit": 250,
     "abstention_threshold": 0.55,   # minimum score to inject
     "recall_floor": 0.34,           # below this coverage, recall says "nothing relevant"
-    "cool_after_days": 120,
-    "seat_expire_after_days": 90,
     "embed_timeout_ms": 300,
     "embed_backend": "lmstudio",      # disabled | lmstudio | custom | sidecar
     "embed_url": "http://127.0.0.1:1234",
     "embed_model": "text-embedding-embeddinggemma-300m-qat",
     "embed_api_key": "",             # custom endpoints only
-    "status_bar_enabled": True,
     "notes_enabled": False,           # temporary notes are opt-in
     "max_notes": 8,
     "expiry_days": 7,
@@ -123,6 +120,51 @@ def _now() -> str:
 def _uid(prefix: str = "f") -> str:
     import secrets
     return f"{prefix}-{secrets.token_hex(4)}"
+
+
+_CONNECTORS = ("et ", "mais ", "donc ", "alors ", "car ", "or ", "puis ",
+               "parce ", "ainsi ", "sinon ", "ensuite ")
+
+
+def looks_like_fragment(text: str, *, strict: bool = False) -> str:
+    """Return why a text is not a self-contained statement, or "" if it is.
+
+    Models occasionally hand over a piece of their own sentence: a clause cut
+    mid-thought, a dictated fragment, a line lifted from a message. Those are
+    worthless as memories and, in the core layer, they steal the most expensive
+    seats in the prompt. The check is deliberately crude and explainable: a fact
+    is a sentence that starts with a capital and ends on a real stop.
+    """
+    body = (text or "").strip()
+    if not body:
+        return "empty"
+    minimum = 5 if strict else 3
+    words = body.split()
+    if len(words) < minimum:
+        return f"too short for a fact ({len(words)} words)"
+    first = body[0]
+    if first.islower() or first in ".,;:!?…":
+        return "starts mid-sentence"
+    if body.lower().startswith(_CONNECTORS):
+        return "starts on a connector"
+    if body.rstrip().endswith((",", ";", ":", "-", "…")):
+        return "ends mid-sentence"
+    return ""
+
+
+def coverage(query: str, text: str) -> float:
+    """Share of the query's own words the text actually contains, from 0 to 1.
+
+    This is the number `recall` reports. It is not a similarity and not a
+    confidence: 1.0 means every word the caller asked for is present, which is
+    allowed to be a poor answer to a vague question — hence the weak flag the
+    provider adds around it.
+    """
+    words = [w for w in normalize(query).split() if len(w) > 2 and w not in STOPWORDS]
+    if not words:
+        return 0.0
+    body = set(normalize(text).split())
+    return round(sum(1 for w in words if w in body) / len(words), 3)
 
 
 def normalize(text: str) -> str:

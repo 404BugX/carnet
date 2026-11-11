@@ -41,7 +41,6 @@ models/
 # Dev-only tooling: local scratch, never committed
 carnet/dev/
 dev/
-tests/
 
-# Held back until the very end (deliberately not published yet)
-README.md
+# Local README preview
+.readme-preview.html

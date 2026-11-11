@@ -1005,11 +1005,22 @@ function WatchView() {
 // Everything that changes how the plugin behaves: the language (applies at
 // once) and the embedding backend (applies at the next session start).
 function Field({ label, value, onChange, placeholder, type }) {
+  // The SDK's Input hands back a change event, while these call sites were
+  // written as if it passed a bare value: a keystroke stored an object and the
+  // field then rendered "[object Object]" for good. Accept both shapes.
+  const shown = typeof value === 'string' ? value : (value == null ? '' : String(value))
+  const handle = (payload) => {
+    if (payload && payload.target && typeof payload.target.value === 'string') {
+      onChange(payload.target.value)
+      return
+    }
+    onChange(typeof payload === 'string' ? payload : '')
+  }
   return jsxs('label', {
     className: 'flex flex-col gap-1',
     children: [
       jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: label }),
-      jsx(Input, { value, onChange, placeholder, type: type || 'text' })
+      jsx(Input, { value: shown, onChange: handle, placeholder, type: type || 'text' })
     ]
   })
 }
@@ -3639,9 +3650,23 @@ function BackendMissing() {
 function CarnetPage() {
   const tab = useValue(tab$)
   const tick = useValue(tick$)
-  const { data: settings } = useQuery({
+  // register() runs once per app start, not per profile switch: the page probes
+  // again when it mounts, otherwise a profile without the backend keeps the
+  // previous one's answers and shows its memories.
+  useEffect(() => { void probeBackend() }, [])
+  const { data: settings, error: settingsError } = useQuery({
     queryKey: ['carnet', 'settings', tick], queryFn: () => api('/settings'), staleTime: 0
   })
+  useEffect(() => {
+    if (!settingsError) return
+    const message = String(settingsError.message || settingsError)
+    if (/plugin not found|404/i.test(message)) {
+      // Cached answers belong to another profile: drop them rather than show
+      // another agent's memory under this one's name.
+      queryClient.removeQueries({ queryKey: ['carnet'] })
+      backendMissing$.set(true)
+    }
+  }, [settingsError])
   const missing = useValue(backendMissing$)
   if (missing) return jsx(BackendMissing, {})
   if (settings && !settings.onboarding_done) {

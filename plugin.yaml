@@ -1,8 +1,18 @@
 name: carnet
 version: 0.9.1
+manifest_version: 2
+api_version: 1
+license: MIT
 author: "404BugX"
+homepage: "https://github.com/404BugX/carnet"
 repository: "https://github.com/404BugX/carnet"
+requires_hermes: ">=0.23.0"
 description: "Four-layer memory: permanent core, facts recalled on demand, sheets read only when needed."
+tags:
+  - memory
+  - local-first
+  - sqlite
+  - desktop
 i18n:
   default: en
   languages:
@@ -16,3 +26,8 @@ hooks:
   - on_session_switch
   - on_profile_created
   - recall_status
+config_schema:
+  embed_api_key:
+    type: secret
+    env: CARNET_EMBED_API_KEY
+    description: "Only needed for a custom embedding endpoint. A local server needs no key."

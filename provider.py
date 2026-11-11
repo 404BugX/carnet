@@ -25,7 +25,8 @@ from typing import Any, Optional
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 
 from .embedder import Embedder
-from .store import DEFAULTS, STOPWORDS, Carnet, normalize, normalize_settings
+from .store import (DEFAULTS, STOPWORDS, Carnet, coverage, looks_like_fragment,
+                    normalize, normalize_settings)
 
 log = logging.getLogger("carnet")
 
@@ -144,12 +145,18 @@ NOTE_TOOLS = [
 # ---------------------------------------------------------------- extraction
 
 _RE_EXPLICIT = re.compile(
-    # `(?<!\w)` : without it, "note" fires inside "notebook", "annotate",
-    # "denote" — hence ghost facts cut in the middle of a word.
-    r"(?<!\w)(?:remember|keep in mind|note|memorize|remind me)"
-    r"\s+(?:that\s+)?(.{10,2000})",
+    # `(?<!\w)` : without it, a trigger fires inside "notebook", "annotate",
+    # "denote". `note` is handled separately on purpose: as a bare word it fires
+    # in any prose ("see the note below", "note_close"), and that is how a pasted
+    # review ends up sliced into facts. It only counts before a first person.
+    r"(?<!\w)(?:remember|memorize|remind me)\s+(?:that\s+)?(.{10,400})",
     re.IGNORECASE,
 )
+_RE_NOTE = re.compile(
+    r"(?<!\w)note\s+that\s+((?:I|my|we|our)\b.{10,400})",
+    re.IGNORECASE,
+)
+
 _RE_PREFERENCE = re.compile(
     r"(?<!\w)\b(i prefer|i don't like|i dislike|i hate|i use|i avoid|i always want|"
     r"from now on|from here on)\b(.{5,2000})",
@@ -187,13 +194,29 @@ def extract(user_text: str) -> list[dict]:
     output: list[dict] = []
 
     def _add(fragment: str, minimum: int, confidence: str) -> None:
-        if _self_contained(fragment, minimum) and len(fragment) <= 500:
-            output.append({"text": fragment, "confidence": confidence, "source": "user"})
+        # The trigger word was consumed, so the tail legitimately starts on a
+        # lowercase word: restore the capital before judging the shape.
+        fragment = (fragment or "").strip()
+        if fragment and fragment[0].islower():
+            fragment = fragment[0].upper() + fragment[1:]
+        if not _self_contained(fragment, minimum) or len(fragment) > 500:
+            return
+        # Last gate: it must read as a sentence on its own, never as the tail of
+        # whatever surrounded it in the original message.
+        if looks_like_fragment(fragment, strict=True):
+            return
+        output.append({"text": fragment, "confidence": confidence, "source": "user"})
 
-    for m in _RE_EXPLICIT.finditer(user_text or ""):
+    # A long paste is not a statement: a real "remember this" lives in the first
+    # lines, and scanning further only harvests fragments of someone else's text.
+    body = (user_text or "")[:1200]
+
+    for m in _RE_EXPLICIT.finditer(body):
+        _add(_first_sentence(m.group(1)), 10, "certain")
+    for m in _RE_NOTE.finditer(body):
         _add(_first_sentence(m.group(1)), 10, "certain")
     if not output:
-        for m in _RE_PREFERENCE.finditer(user_text or ""):
+        for m in _RE_PREFERENCE.finditer(body):
             _add(_first_sentence(m.group(1) + m.group(2)), 12, "probable")
     # internal deduplication
     seen, unique = set(), []
@@ -235,6 +258,22 @@ def _first_sentence(fragment: str) -> str:
 
 # ---------------------------------------------------------------- provider
 
+def _secret(name: str) -> str:
+    """Read a credential through Hermes's own route.
+
+    A plugin must not invent its own credential store: `agent.secret_scope`
+    honours the active profile, so a multiplexed gateway never hands one
+    profile's key to another. The plugin config remains a fallback for keys
+    typed in the settings screen before this route existed.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "")
+    except Exception:
+        return ""
+
+
 def _fix_mojibake(text: str) -> str:
     """Undo a UTF-8 text that was decoded as CP1252 somewhere upstream.
 
@@ -244,13 +283,19 @@ def _fix_mojibake(text: str) -> str:
     """
     if not text or not isinstance(text, str):
         return text or ""
-    if not any(ord(ch) in (0xC2, 0xC3, 0xE2, 0x80) for ch in text):
+    if all(ord(ch) < 0x80 for ch in text):
         return text
-    try:
-        repaired = text.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return text
-    return repaired if repaired.count("\ufffd") <= text.count("\ufffd") else text
+    # Two tables produce this: CP1252 (the usual one) and MacRoman, which turns
+    # "à" into "√†". Try both and keep the first that decodes cleanly.
+    best = text
+    for encoding in ("cp1252", "mac_roman"):
+        try:
+            candidate = text.encode(encoding, errors="strict").decode("utf-8", errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if candidate and candidate.count("\ufffd") <= best.count("\ufffd"):
+            best = candidate
+    return best
 
 
 def _modern_args(args: dict) -> dict:
@@ -358,7 +403,8 @@ class CarnetProvider(MemoryProvider):
                                       backend=backend,
                                       url=str(self._config.get("embed_url") or ""),
                                       model=str(self._config.get("embed_model") or ""),
-                                      api_key=str(self._config.get("embed_api_key") or ""),
+                                      api_key=_secret("CARNET_EMBED_API_KEY")
+                                      or str(self._config.get("embed_api_key") or ""),
                                       model_dir=model_dir)
             self._embedder.start_in_background()
         except Exception as exc:
@@ -841,6 +887,21 @@ class CarnetProvider(MemoryProvider):
             importance = 1
         if importance not in (0, 1, 2):
             importance = 1
+        # A fragment is not a memory. The core layer is checked harder because
+        # each of its seats is charged to every single turn.
+        if importance < 2:
+            why = looks_like_fragment(text, strict=(importance == 0))
+            if why:
+                return json.dumps({
+                    "success": False,
+                    "error": "not a self-contained fact",
+                    "reason": why,
+                    "message": (
+                        "Nothing was recorded. A fact is one full sentence about one thing, "
+                        "starting with a capital and ending on a stop. Rewrite it in full "
+                        "instead of copying a piece of your own message."
+                    ),
+                }, ensure_ascii=False)
         # Layer 2 (sheets, importance=2): no limit — it is a document, read on demand.
         # Layer 0 (core): 250; layer 1 (fact): 500.
         # An overflow is REFUSED, never trimmed: a fact cut at the character level
@@ -916,14 +977,7 @@ class CarnetProvider(MemoryProvider):
         full lexical match, and it is allowed to be a bad answer to a vague
         question — which is exactly what the `weak` flag says.
         """
-        # Plain words only: `query_terms` also emits glued bigrams for FTS, and
-        # those never appear as tokens, which would cap every score below 1.0.
-        words = [w for w in normalize(query).split() if len(w) > 2 and w not in STOPWORDS]
-        if not words:
-            return 0.0
-        body = set(normalize(text).split())
-        hit = sum(1 for w in words if w in body)
-        return round(hit / len(words), 3)
+        return coverage(query, text)
 
     def _tool_recall(self, args: dict) -> str:
         q = _fix_mojibake(args.get("query") or "")
