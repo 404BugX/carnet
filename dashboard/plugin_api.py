@@ -565,20 +565,14 @@ STATUS_VALUES = {"active", "replaced", "removed"}
 
 
 def _folder() -> Path:
-    """The database folder, resolved on every request.
+    """The database folder of the profile being served, and no other.
 
-    The gateway can serve several profiles: HERMES_HOME does not necessarily
-    designate the one that owns memory. If the database is not there and a single
-    profile has one, that is it — otherwise keep the expected path so the error
-    stays readable.
+    There used to be a fallback that borrowed the only database found under
+    ``profiles/*``. That is worse than an empty page: a profile then displays
+    another agent's memories as if they were its own, which is exactly the kind
+    of mistake a memory must never make. Each profile reads its own home.
     """
-    direct = _HOME / "carnet"
-    if (direct / "carnet.db").exists():
-        return direct
-    candidates = sorted(Path.home().glob(".hermes/profiles/*/carnet/carnet.db"))
-    if len(candidates) == 1:
-        return candidates[0].parent
-    return direct
+    return _HOME / "carnet"
 
 
 def _base():

@@ -313,6 +313,33 @@ class CarnetProvider(MemoryProvider):
         self._root = self._home / "carnet"
         self._store = Carnet(self._root)
         self._store.init_schema()
+        # `hermes profile create` copies the whole home, memory database
+        # included. A brand-new profile must not wake up with another agent's
+        # life: when the base was written by a different home that still exists,
+        # this is a copy, so it is emptied. If that home is gone, the profile was
+        # moved and the memory has to be kept.
+        try:
+            stamped = self._store.meta_get("profile_home", "")
+            here = str(self._home)
+            if not stamped:
+                self._store.meta_set("profile_home", here)
+            elif stamped != here:
+                if Path(stamped).exists():
+                    removed = self._store.reset_memory(reason=f"cloned from {stamped}")
+                    # The injection journal holds another agent's queries: it is
+                    # copied along with the database and must not stay either.
+                    for name in ("injections.jsonl", "embed.log"):
+                        try:
+                            (self._root / name).unlink()
+                        except OSError:
+                            pass
+                    log.info("carnet: database copied from %s, %d facts cleared for %s",
+                             stamped, removed, here)
+                else:
+                    log.info("carnet: database moved from %s to %s, memory kept", stamped, here)
+                self._store.meta_set("profile_home", here)
+        except Exception as exc:
+            log.warning("carnet: clone check failed: %s", exc)
         self._refresh_config()
         self._session_id = session_id or ""
         self._first_turn = True

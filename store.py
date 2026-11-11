@@ -375,6 +375,46 @@ class Carnet:
         row = self.conn.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
         return row["v"] if row else default
 
+    # Tables that hold memory, as opposed to the schema itself. A cloned
+    # profile must start empty, not inherit another agent's life.
+    MEMORY_TABLES = (
+        "facts_fts", "vec", "injected", "pending", "propositions",
+        "links", "entities", "journal", "notes", "facts",
+    )
+
+    def reset_memory(self, reason: str = "") -> int:
+        """Deletes every fact, vector, note and trace, keeping the schema.
+
+        Returns the number of facts removed, so the caller can log something
+        precise rather than a vague "cleaned up".
+        """
+        removed = 0
+        try:
+            removed = int(self.conn.execute("SELECT count(*) n FROM facts").fetchone()["n"])
+        except Exception:
+            removed = 0
+        for table in self.MEMORY_TABLES:
+            try:
+                self.conn.execute(f"DELETE FROM {table}")
+            except Exception:
+                pass
+        for key in ("seat_pressure", "core_updated_at", "last_watch"):
+            try:
+                self.conn.execute("DELETE FROM meta WHERE k=?", (key,))
+            except Exception:
+                pass
+        try:
+            self.meta_set("created_at", _now())
+        except Exception:
+            pass
+        self.conn.commit()
+        if reason:
+            try:
+                self.log("system", "memory_reset", None, {"reason": reason, "facts_removed": removed})
+            except Exception:
+                pass
+        return removed
+
     def meta_set(self, k: str, v: str) -> None:
         self.conn.execute(
             "INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
