@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Local state and data: never in the repo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+carnet-data/
+plugin-data/
+state/
+logs/
+
+# Secrets, keys, local config
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+config.local.*
+
+# Model weights and caches
+models/
+*.gguf
+*.safetensors
+*.onnx
+.cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Dev-only tooling: local scratch, never committed
+carnet/dev/
+dev/
+tests/
+
+# Held back until the very end (deliberately not published yet)
+README.md

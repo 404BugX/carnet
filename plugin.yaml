@@ -1,0 +1,18 @@
+name: carnet
+version: 0.9.0
+author: "404BugX"
+repository: "https://github.com/404BugX/carnet"
+description: "Four-layer memory: permanent core, facts recalled on demand, sheets read only when needed."
+i18n:
+  default: en
+  languages:
+    - en
+    - fr
+hooks:
+  - prefetch
+  - queue_prefetch
+  - sync_turn
+  - on_pre_compress
+  - on_session_switch
+  - on_profile_created
+  - recall_status
