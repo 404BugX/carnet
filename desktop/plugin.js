@@ -3623,7 +3623,7 @@ function BackendMissing() {
         children: [
           jsx('h1', { className: 'carnet-ob-title', children: 'Carnet is not enabled in this profile' }),
           jsx('p', { className: 'carnet-ob-lead', children: 'The interface is installed for the whole app, but the memory itself lives inside a profile. This one does not have it yet, so every request comes back empty.' }),
-          jsx('pre', { className: 'carnet-ob-cmd', children: 'hermes -p <profile> plugins install carnet' }),
+          jsx('pre', { className: 'carnet-ob-cmd', children: 'hermes -p <profile> plugins install 404BugX/carnet' }),
           jsx('p', { className: 'carnet-ob-lead', children: 'Run it in a terminal with the profile name, then retry. Without a profile name it targets the default one.' }),
           jsx(Button, {
             className: 'carnet-ob-cta',
@@ -4236,17 +4236,24 @@ export default {
     _ctx = ctx
     mountStylesheet()
     await loadStrings().catch(() => {})
+    const paletteLabel = t('dashboard.palette.open') === 'dashboard.palette.open'
+      ? 'Open Carnet'
+      : t('dashboard.palette.open')
     const settings = await probeBackend()
     if (settings) {
       modelMode$.set(['custom', 'lmstudio'].includes(settings.model_mode) ? settings.model_mode : 'off')
     }
     return ctx.registerMany([
       { id: 'page', area: ROUTES_AREA, data: { path: '/carnet' }, render: () => jsx(CarnetPage, {}) },
-      { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: '/carnet', label: t('dashboard.nav.label'), codicon: 'book' } },
+      // A product name does not translate, and this label must survive a backend
+      // that cannot serve the strings yet.
+      { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: '/carnet', label: 'Carnet', codicon: 'book' } },
       {
         id: 'open', area: PALETTE_AREA,
         data: {
-          id: 'carnet.open', label: t('dashboard.palette.open'), keywords: ['memory', 'facts', 'watch'],
+          id: 'carnet.open',
+          label: paletteLabel,
+          keywords: ['memory', 'facts', 'watch'],
           run: () => host.navigate('/carnet')
         }
       }
