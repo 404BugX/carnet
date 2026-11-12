@@ -27,29 +27,10 @@ def _stats(args) -> None:
     print(f"  {translate('cli.stat_last_watch'):<12} {c.meta_get('last_watch', '-')}")
 
 
-def _report(results: list[dict]) -> None:
-    for r in results:
-        print(translate(f"cli.link_{r['status']}", profile=r["profile"]))
-
-
-def _link(args) -> None:
-    from .profiles import link_all
-    _report(link_all())
-
-
-def _unlink(args) -> None:
-    from .profiles import unlink_all
-    _report(unlink_all())
-
-
 def _carnet_command(args) -> None:
     sub = getattr(args, "carnet_command", None)
     if sub == "stats":
         _stats(args)
-    elif sub == "link":
-        _link(args)
-    elif sub == "unlink":
-        _unlink(args)
     else:
         print(translate("cli.usage"))
 
@@ -57,6 +38,4 @@ def _carnet_command(args) -> None:
 def register_cli(subparser) -> None:
     subs = subparser.add_subparsers(dest="carnet_command")
     subs.add_parser("stats", help=translate("cli.help_stats"))
-    subs.add_parser("link", help=translate("cli.help_link"))
-    subs.add_parser("unlink", help=translate("cli.help_unlink"))
     subparser.set_defaults(func=_carnet_command)

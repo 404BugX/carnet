@@ -7,13 +7,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import uuid
 import sqlite3
 import threading
+import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+log = logging.getLogger("carnet.store")
 
 SCHEMA_VERSION = 1
 
@@ -46,17 +51,16 @@ DEFAULTS = {
     "embed_backend": "lmstudio",      # disabled | lmstudio | custom | sidecar
     "embed_url": "http://127.0.0.1:1234",
     "embed_model": "text-embedding-embeddinggemma-300m-qat",
-    "embed_api_key": "",             # custom endpoints only
     "notes_enabled": False,           # temporary notes are opt-in
     "max_notes": 8,
     "expiry_days": 7,
     "note_char_limit": 300,
-    "model_mode": "off",              # off | custom (rephrase and watch)
+    "model_mode": "off",              # off | custom | lmstudio (rephrase and watch)
     "model_url": "",
     "model_name": "",
-    "model_api_key": "",
     "rerank": False,
     "python_venv": "",
+    "index_wait_s": 8,                # how long a start waits for the embedder
 }
 
 MEMORY_KEYS = (
@@ -243,6 +247,58 @@ class Carnet:
 
     # -- schema ------------------------------------------------------
     def init_schema(self) -> None:
+        """Create or migrate. Never fatal because another process is writing."""
+        # A short busy timeout during the attempts: the default would make four
+        # retries cost a minute before giving up.
+        try:
+            previous = self.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            self.conn.execute("PRAGMA busy_timeout = 1200")
+        except sqlite3.DatabaseError:
+            previous = None
+        # One short probe first: if a writer holds the database, retrying every
+        # DDL statement would cost a minute for nothing. The schema is already
+        # there in the common case, so we simply skip the migration pass.
+        if not self._writable():
+            log.warning("carnet: database busy at open; skipping the migration pass")
+            if previous is not None:
+                try:
+                    self.conn.execute(f"PRAGMA busy_timeout = {int(previous)}")
+                except sqlite3.DatabaseError:
+                    pass
+            return
+        try:
+            self._init_schema_once()
+            if previous is not None:
+                self.conn.execute(f"PRAGMA busy_timeout = {int(previous)}")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            log.warning("carnet: migration failed on a busy database: %s", exc)
+        # Still locked: the schema is almost certainly already in place, and
+        # refusing to start would cost the whole session. Open read-write and let
+        # the first real write surface the problem if there is one.
+        log.warning("carnet: database stayed busy at open; starting without migration")
+        if previous is not None:
+            try:
+                self.conn.execute(f"PRAGMA busy_timeout = {int(previous)}")
+            except sqlite3.DatabaseError:
+                pass
+
+    def _writable(self) -> bool:
+        """Can we take the write lock right now, without waiting long?"""
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute("ROLLBACK")
+            return True
+        except sqlite3.DatabaseError:
+            try:
+                self.conn.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            return False
+
+    def _init_schema_once(self) -> None:
         c = self.conn
         c.executescript("""
         CREATE TABLE IF NOT EXISTS facts (
@@ -361,13 +417,65 @@ class Carnet:
         self._set_meta_if_missing("created_at", _now())
 
     # -- meta --------------------------------------------------------
+    def _prune_traces(self) -> None:
+        """Keep the debugging tables bounded. Best effort, never fatal."""
+        for sql in (
+            "DELETE FROM injected WHERE rowid NOT IN "
+            "(SELECT rowid FROM injected ORDER BY rowid DESC LIMIT 20000)",
+            "DELETE FROM journal WHERE rowid NOT IN "
+            "(SELECT rowid FROM journal ORDER BY rowid DESC LIMIT 20000)",
+        ):
+            try:
+                self.conn.execute(sql)
+            except sqlite3.DatabaseError:
+                return
+        self.conn.commit()
+
+    def _ensure_db_id(self) -> None:
+        """A random identity written once, inside the database.
+
+        It travels with a copy and with a move, which is exactly what tells the
+        clone check what happened: the file at the old path carries the same
+        identity, or it does not.
+        """
+        if self.meta_get("db_id", ""):
+            return
+        self.meta_set("db_id", uuid.uuid4().hex)
+
+    def _add_columns(self) -> None:
+        """Add every column a newer version expects. Safe under a race."""
+        wanted = (
+            ("facts", "keywords", "TEXT"),
+            ("facts", "uses", "INTEGER NOT NULL DEFAULT 0"),
+            ("facts", "last_used_at", "TEXT"),
+            ("notes", "kind", "TEXT NOT NULL DEFAULT 'fact'"),
+            ("notes", "session_id", "TEXT"),
+            ("propositions", "fingerprint", "TEXT"),
+        )
+        for table, column, decl in wanted:
+            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if not existing or column in existing:
+                continue
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError as exc:
+                # Another opener won the race between our read and our ALTER.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        self.conn.commit()
+
     def _migrate(self) -> None:
-        """Add recent columns and rebuild the FTS index if its schema changed."""
-        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(facts)")}
-        prop_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(propositions)")}
-        if prop_cols and "fingerprint" not in prop_cols:
-            self.conn.execute("ALTER TABLE propositions ADD COLUMN fingerprint TEXT")
-            self.conn.commit()
+        """Add recent columns and rebuild the FTS index if its schema changed.
+
+        Two processes can open the same profile at once (the gateway and a CLI
+        command): both read the columns, both see the same gap, and the second
+        ALTER fails with `duplicate column name`, which used to escape
+        initialize(). Every DDL statement is therefore tolerant of "someone else
+        did it first", and the whole pass runs under one write lock.
+        """
+        self._add_columns()
+        self._ensure_db_id()
+        self._prune_traces()
         # Catch-up: earlier propositions have no fingerprint, so an already recorded
         # rejection would be proposed again. Recompute it from the current texts.
         for row in self.conn.execute(
@@ -382,32 +490,40 @@ class Carnet:
                 )
         self.conn.commit()
 
-        if "keywords" not in cols:
-            self.conn.execute("ALTER TABLE facts ADD COLUMN keywords TEXT")
-        # Usage counters: how many times a fact was kept by recall.
-        if "uses" not in cols:
-            self.conn.execute("ALTER TABLE facts ADD COLUMN uses INTEGER NOT NULL DEFAULT 0")
-        if "last_used_at" not in cols:
-            self.conn.execute("ALTER TABLE facts ADD COLUMN last_used_at TEXT")
-
         # A note is not always a reminder to execute: it can be a question left
         # open or a fact to keep in mind until it is confirmed. And without its
         # originating session, an obscure note cannot be traced back.
-        note_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(notes)")}
-        if note_cols and "kind" not in note_cols:
-            self.conn.execute("ALTER TABLE notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'")
-        if note_cols and "session_id" not in note_cols:
-            self.conn.execute("ALTER TABLE notes ADD COLUMN session_id TEXT")
         fts_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(facts_fts)")}
-        if "keywords" not in fts_cols:
-            self.conn.execute("DROP TABLE IF EXISTS facts_fts")
-            self.conn.execute("""CREATE VIRTUAL TABLE facts_fts USING fts5(
-                fact_id UNINDEXED, text, topic, keywords,
-                tokenize="unicode61 remove_diacritics 2")""")
-            self.conn.execute(
-                """INSERT INTO facts_fts(fact_id, text, topic, keywords)
-                   SELECT id, text, ifnull(topic,''), ifnull(keywords,'') FROM facts"""
-            )
+        rebuild = "keywords" not in fts_cols
+        if not rebuild:
+            # A rebuild interrupted between its DROP and its INSERT leaves the
+            # right columns and no rows: the schema looks current, so nothing
+            # would ever fill it again. An empty index beside a full table is
+            # always a broken index.
+            try:
+                indexed = int(self.conn.execute("SELECT count(*) FROM facts_fts").fetchone()[0])
+                facts = int(self.conn.execute(
+                    "SELECT count(*) FROM facts WHERE status='active'").fetchone()[0])
+                rebuild = indexed == 0 and facts > 0
+            except sqlite3.DatabaseError:
+                rebuild = True
+        if rebuild:
+            # One transaction: either the old index is still there, or the new one
+            # is complete. Never a table that exists and holds nothing.
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute("DROP TABLE IF EXISTS facts_fts")
+                self.conn.execute("""CREATE VIRTUAL TABLE facts_fts USING fts5(
+                    fact_id UNINDEXED, text, topic, keywords,
+                    tokenize="unicode61 remove_diacritics 2")""")
+                self.conn.execute(
+                    """INSERT INTO facts_fts(fact_id, text, topic, keywords)
+                       SELECT id, text, ifnull(topic,''), ifnull(keywords,'') FROM facts"""
+                )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
             self.log("system", "index_rebuild", None, None)
 
     def _set_meta_if_missing(self, k: str, v: str) -> None:
@@ -430,26 +546,18 @@ class Carnet:
         Returns the number of facts removed, so the caller can log something
         precise rather than a vague "cleaned up".
         """
-        removed = 0
+        self.conn.execute("BEGIN IMMEDIATE")
         try:
             removed = int(self.conn.execute("SELECT count(*) n FROM facts").fetchone()["n"])
-        except Exception:
-            removed = 0
-        for table in self.MEMORY_TABLES:
-            try:
+            for table in self.MEMORY_TABLES:
                 self.conn.execute(f"DELETE FROM {table}")
-            except Exception:
-                pass
-        for key in ("seat_pressure", "core_updated_at", "last_watch"):
-            try:
+            for key in ("seat_pressure", "core_updated_at", "last_watch"):
                 self.conn.execute("DELETE FROM meta WHERE k=?", (key,))
-            except Exception:
-                pass
-        try:
             self.meta_set("created_at", _now())
+            self.conn.execute("COMMIT")
         except Exception:
-            pass
-        self.conn.commit()
+            self.conn.execute("ROLLBACK")
+            raise
         if reason:
             try:
                 self.log("system", "memory_reset", None, {"reason": reason, "facts_removed": removed})
@@ -496,8 +604,11 @@ class Carnet:
         if len(text) < 15 or len(text.split()) < 3:
             return {"id": None, "is_new": False, "error": "fact too short: write a complete sentence"}
 
-        # A core seat is only obtained through promote(), which enforces the limit.
-        importance = 1 if int(importance) == 0 else int(importance)
+        # A core seat is only obtained through promote(), which enforces the
+        # limit: a fact created here starts at layer 1 and the caller promotes it.
+        # The result says so explicitly, so nobody believes a seat was granted.
+        seat_requested = int(importance) == 0
+        importance = 1 if seat_requested else int(importance)
 
         h = fingerprint(text)
         now = _now()
@@ -543,7 +654,11 @@ class Carnet:
             (fid, normalize(text), normalize(topic or ""), normalize(keywords or "")),
         )
         self.log(actor, "created", fid, {"text": text[:200], "importance": importance})
-        return {"id": fid, "is_new": True}
+        result = {"id": fid, "is_new": True}
+        if seat_requested:
+            result["seat"] = False
+            result["note"] = "stored as a fact; promote() grants a core seat"
+        return result
 
     def replace_fact(self, old_id: str, text: str, **kw) -> dict:
         """New version: the old one becomes 'replaced'. Nothing is destroyed.
@@ -553,9 +668,11 @@ class Carnet:
         the limit of 20 refuses it and the seat disappears.
         """
         old = self.conn.execute(
-            "SELECT importance FROM facts WHERE id=?", (old_id,)
+            "SELECT importance, status FROM facts WHERE id=?", (old_id,)
         ).fetchone()
-        inherits_seat = bool(old) and int(old["importance"]) == 0
+        if not old or str(old["status"] or "") != "active":
+            return {"id": None, "is_new": False, "error": f"unknown fact id: {old_id}"}
+        inherits_seat = int(old["importance"]) == 0
         new = self.add_fact(text, force=True, **kw)
         if new.get("id") and new.get("is_new"):
             now = _now()
@@ -723,7 +840,8 @@ class Carnet:
                    ORDER BY rank LIMIT ?""",
                 (expr, limit),
             ))
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            log.warning("carnet: search index unavailable (%s); lexical results are lost", exc)
             return []
         if not rows:
             return []

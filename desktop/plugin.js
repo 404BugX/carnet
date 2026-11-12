@@ -33,7 +33,10 @@ const sort$ = atom('recent')
 const status$ = atom('active')
 const openFact$ = atom('')
 const tick$ = atom(0)   // incremented after every action → fresh query key
-const modelMode$ = atom('off')   // 'custom' enables rephrase and watch
+const modelMode$ = atom('off')   // 'custom' or 'lmstudio' enables rephrase and watch
+// The backend accepts both modes for rephrase and for the watch; the page used to
+// accept only 'custom', so a model configured through LM Studio looked disabled.
+const modelEnabled = (mode) => mode === 'custom' || mode === 'lmstudio'
 
 // Labels are keys into the locale files, resolved by t() at render time: no
 // translation is written twice, the dashboard and the backend read the same
@@ -634,7 +637,7 @@ function FactRow({ f }) {
                   jsx('div', { className: 'flex-1' }),
                   // One verb per button, no accent colour: the bar must not
                   // shout louder than the memory it describes.
-                  modelMode === 'custom'
+                  modelEnabled(modelMode)
                     ? jsx(Button, {
                         size: 'sm', variant: 'outline',
                         disabled: rewriting === 'running',
@@ -901,14 +904,14 @@ function WatchView() {
         className: 'flex items-center gap-3',
         children: [
           jsx(Button, {
-            size: 'sm', onClick: scan, disabled: running || modelMode !== 'custom',
+            size: 'sm', onClick: scan, disabled: running || !modelEnabled(modelMode),
             children: running ? t('dashboard.watch.running') : t('dashboard.actions.scan')
           }),
           jsx('span', {
             className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
             children: t('dashboard.watch.pending', { count: props.length })
           }),
-          modelMode !== 'custom'
+          !modelEnabled(modelMode)
             ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: t('dashboard.watch.model_off') })
             : null
         ]
@@ -1220,10 +1223,9 @@ function ModelSettings() {
                 onChange: (model) => edit({ model }), placeholder: 'gemma-4-e2b-it'
               }),
               draft.mode === 'custom'
-                ? jsx(Field, {
-                    label: t('dashboard.settings.embedding_key'), value: draft.api_key,
-                    onChange: (api_key) => edit({ api_key }), type: 'password',
-                    placeholder: data.api_key_set ? t('dashboard.settings.embedding_key_keep') : ''
+                ? jsx('div', {
+                    className: 'text-xs opacity-60',
+                    children: t('dashboard.settings.embedding_key_env')
                   })
                 : null
             ]
@@ -1348,10 +1350,9 @@ function SettingsView() {
                 onChange: (model) => edit({ model }), placeholder: 'embeddinggemma'
               }),
               draft.mode === 'custom'
-                ? jsx(Field, {
-                    label: t('dashboard.settings.embedding_key'), value: draft.api_key,
-                    onChange: (api_key) => edit({ api_key }), type: 'password',
-                    placeholder: emb.api_key_set ? t('dashboard.settings.embedding_key_keep') : ''
+                ? jsx('div', {
+                    className: 'text-xs opacity-60',
+                    children: t('dashboard.settings.model_key_env')
                   })
                 : null
             ]
@@ -3498,7 +3499,11 @@ function Onboarding() {
           className: 'carnet-ob-download',
           children: [
             local.state === 'ready'
-              ? jsx(Badge, { children: t('onboarding.embedding.ready') })
+              ? jsx(Badge, {
+                  children: local.integrity === 'verified'
+                    ? t('onboarding.embedding.ready')
+                    : t('onboarding.embedding.ready_sizes'),
+                })
               : jsx(Button, {
                   size: 'sm',
                   variant: 'outline',

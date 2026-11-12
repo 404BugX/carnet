@@ -7,7 +7,7 @@ Four modes, same interface:
   One local process for everything (embeddings + small models), no more sidecar,
   no more onnxruntime, no more venv to purge. Vectors live in ``vec``.
 - ``custom`` — any OpenAI-compatible /v1/embeddings endpoint (URL, model, key).
-- ``sidecar`` — ``dev/embed_server.py`` in the Hermes venv, running the local
+- ``sidecar`` — ``sidecar/embed_server.py`` in the Hermes venv, running the local
   ONNX model downloaded once in the shared profile cache.
 
 Similarity is computed here, in pure Python: the plugin runtime has no numpy.
@@ -20,10 +20,11 @@ Golden rule: no waiting on the hot path. If the backend is not ready,
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
+import queue
 import logging
 import os
-import select
 import shutil
 import subprocess
 import threading
@@ -160,6 +161,10 @@ def _ensure_watch() -> None:
 
 
 class Embedder:
+    # Loading a 300 MB ONNX model takes a few seconds on a laptop: the startup
+    # line is waited for this long, then the child is killed rather than trusted.
+    START_TIMEOUT = 45.0
+
     def __init__(self, db: Path, server: Path, python: str = "", timeout_ms: int = 300,
                  backend: str = "lmstudio", url: str = DEFAULT_URL, model: str = DEFAULT_MODEL,
                  api_key: str = "", model_dir: str = ""):
@@ -175,6 +180,7 @@ class Embedder:
         self.proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._ready = threading.Event()
+        self._restart_lock = threading.Lock()
         self._error = ""
         self._state = {"dim": 0, "n": 0}
         self._cache: dict[str, array] = {}
@@ -247,6 +253,65 @@ class Embedder:
         entry["touched"] = time.monotonic()
         self._ready.set()
         return True
+
+    def _read_line(self, wait: float) -> Optional[str]:
+        """One line from the child, or None after `wait` seconds.
+
+        Reading the text stream and waiting on its file descriptor do not agree:
+        the wrapper can hold whole lines while select() sees nothing, which made
+        a healthy child look dead whenever two lines arrived in one burst. A
+        reader thread owns the stream, and every caller waits on a queue.
+        """
+        try:
+            return self._lines.get(timeout=max(0.0, wait))
+        except queue.Empty:
+            return None
+
+    def _start_reader(self) -> None:
+        stream = self.proc.stdout if self.proc else None
+        if stream is None:
+            return
+        # The queue is captured by the pump, never looked up through `self`:
+        # after a restart the old pump must not push its end-of-stream marker
+        # into the new generation's queue, where a caller would read it as "the
+        # child died" and kill a healthy sidecar.
+        lines = queue.Queue()
+        self._lines = lines
+
+        def _pump():
+            try:
+                for line in stream:
+                    lines.put(line)
+            except Exception:
+                pass
+            finally:
+                lines.put(None)            # this child is gone
+
+        reader = threading.Thread(target=_pump, name="carnet-embed-reader", daemon=True)
+        reader.start()
+
+    def _restart(self) -> None:
+        """Start the child again after a timeout or a crash. One attempt.
+
+        Readiness is not a gate here: after a crash the flag can still be set,
+        and refusing to restart because "we are ready" is how the channel stayed
+        dead for the rest of the process. A live child is the only reason not to.
+        """
+        if self.backend != "sidecar":
+            return
+        if self.proc is not None and self.proc.poll() is None:
+            self._ready.clear()
+            _kill_sidecar(self.proc)
+            self.proc = None
+        with self._restart_lock:
+            now = time.monotonic()
+            if now - getattr(self, "_last_restart", 0.0) < 5.0:
+                return                  # never a spawn storm, never two children
+            self._last_restart = now
+        try:
+            self._start_sidecar()
+        except Exception as exc:
+            log.warning("carnet: embedding server restart failed: %s", exc)
 
     def _touch(self) -> None:
         with _RUNTIME_LOCK:
@@ -322,10 +387,37 @@ class Embedder:
                 self._error = "local model not downloaded"
                 return
         try:
-            journal = open(self.db.parent / "embed.log", "a", encoding="utf-8")
-            env = {k: v for k, v in os.environ.items()
-                   if k not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP")}
-            env["PYTHONNOUSERSITE"] = "1"
+            log_path = self.db.parent / "embed.log"
+            try:                    # a debugging trace, not a record: cap it
+                if log_path.exists() and log_path.stat().st_size > 4 * 1024 * 1024:
+                    # By bytes, not by lines: one long traceback is a single line
+                    # and would defeat a line-based cap.
+                    with open(log_path, "rb") as f:
+                        f.seek(log_path.stat().st_size - 2 * 1024 * 1024)
+                        keep = f.read()
+                    newline = keep.find(b"\n")
+                    if newline != -1:
+                        keep = keep[newline + 1:]
+                    if not keep.strip():
+                        # One long line and nothing else: dropping "the rest of
+                        # the line" would erase the whole trace. Keep the tail.
+                        keep = b"[truncated]\n" + keep
+                    log_path.write_bytes(keep)
+            except OSError:
+                pass
+            journal = open(log_path, "a", encoding="utf-8")
+            # Minimal environment: the child reads a model and a database, it has
+            # no business inheriting the gateway's credentials or paths.
+            env = {
+                "PATH": os.environ.get("PATH") or "/usr/local/bin:/usr/bin:/bin",
+                "HOME": os.environ.get("HOME") or str(Path.home()),
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONUNBUFFERED": "1",
+            }
+            for keep in ("TMPDIR", "LANG", "LC_ALL", "PYENV_ROOT", "CONDA_PREFIX",
+                         "VIRTUAL_ENV"):
+                if os.environ.get(keep):
+                    env[keep] = os.environ[keep]
             if self.model_dir:
                 env["CARNET_MODEL"] = str(self.model_dir)
             self.proc = subprocess.Popen(
@@ -333,8 +425,29 @@ class Embedder:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=journal,
                 text=True, bufsize=1, cwd=str(self.server.parent), env=env,
             )
-            line = self.proc.stdout.readline() if self.proc.stdout else ""
-            rep = json.loads(line) if line.strip() else {}
+            self._start_reader()
+            line = self._read_line(self.START_TIMEOUT) or ""
+            if not line:
+                _kill_sidecar(self.proc)
+                self.proc = None
+                self._error = "startup timeout"
+                log.warning("carnet: embedding server did not answer within %s s",
+                            self.START_TIMEOUT)
+                return
+            # The child may print a banner or a warning before its JSON line:
+            # skip anything that is not the answer instead of failing on it.
+            rep = {}
+            deadline = time.monotonic() + self.START_TIMEOUT
+            while line.strip() and not rep:
+                try:
+                    rep = json.loads(line)
+                except ValueError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    line = self._read_line(left) or ""
+                    if not line:
+                        break
             if rep.get("ok"):
                 self._state = {"dim": rep.get("dim", 0), "n": rep.get("n", 0)}
                 _ensure_watch()
@@ -347,23 +460,50 @@ class Embedder:
                 self._ready.set()
             else:
                 self._error = "invalid startup response"
+                # The child is alive but useless, and it holds the model: leaving
+                # it running is how a failed start leaks a process per attempt.
+                if self.proc is not None:
+                    _kill_sidecar(self.proc)
+                    self.proc = None
+                self._ready.clear()
         except Exception as exc:
             self._error = f"{type(exc).__name__}: {exc}"
             log.warning("carnet: embedding server unavailable: %s", self._error)
+            # A half-started child holds the model in memory and answers nothing:
+            # keeping it means every later call says "not ready" for ever.
+            if self.proc is not None:
+                _kill_sidecar(self.proc)
+                self.proc = None
+            self._ready.clear()
 
     def _call(self, request: dict, timeout: Optional[float] = None) -> dict:
         p = self.proc
+        if p is not None and p.poll() is not None:
+            # The child is gone: the readiness flag is a lie from this moment on.
+            self._ready.clear()
         if not p or not self._ready.is_set() or p.poll() is not None:
-            return {"ok": False, "error": "server not ready"}
+            # A killed or crashed child is restarted here, once: without this the
+            # embedding channel would stay dead until the process restarts.
+            self._restart()
+            p = self.proc
+            if not p or not self._ready.is_set() or p.poll() is not None:
+                return {"ok": False, "error": "server not ready"}
         wait = self.timeout if timeout is None else timeout
         with self._lock:
             try:
                 p.stdin.write(json.dumps(request) + "\n")
                 p.stdin.flush()
-                r, _, _ = select.select([p.stdout], [], [], wait)
-                if not r:
+                line = self._read_line(wait)
+                if line is None:
+                    # The child still holds the request and its answer would be
+                    # read as the reply to the next one, silently pairing every
+                    # query with the previous result. Kill it instead: the next
+                    # call starts a fresh one.
+                    _kill_sidecar(p)
+                    self._ready.clear()
+                    self._error = "timeout"
+                    log.warning("carnet: embedding server timed out, restarted on the next call")
                     return {"ok": False, "error": "timeout"}
-                line = p.stdout.readline()
                 self._touch()
                 return json.loads(line) if line.strip() else {"ok": False, "error": "empty response"}
             except Exception as exc:
@@ -378,7 +518,7 @@ class Embedder:
 
     def vector_count(self) -> int:
         try:
-            with self._conn() as c:
+            with contextlib.closing(self._conn()) as c:
                 return c.execute("SELECT count(*) n FROM vec").fetchone()["n"]
         except Exception:
             return 0
@@ -388,7 +528,7 @@ class Embedder:
             return
         self._cache = {}
         try:
-            with self._conn() as c:
+            with contextlib.closing(self._conn()) as c:
                 for r in c.execute("SELECT fact_id, blob FROM vec"):
                     self._cache[r["fact_id"]] = array("f", r["blob"])
         except Exception as exc:
@@ -396,7 +536,7 @@ class Embedder:
         self._cache_loaded = True
 
     def _store(self, items: list[tuple[str, array]]) -> int:
-        with self._conn() as c:
+        with contextlib.closing(self._conn()) as c:
             for fid, v in items:
                 c.execute(
                     "INSERT INTO vec(fact_id, dim, blob) VALUES (?,?,?) "
@@ -410,7 +550,16 @@ class Embedder:
 
     # -- public API (identical for both backends) --------------------
     def search(self, query: str, k: int = 20) -> list[tuple[str, float]]:
-        if not self.ready or not query.strip():
+        if not query.strip():
+            return []
+        if not self.ready and self.backend == "sidecar":
+            # A dead child must be revived by the call that needs it, but a
+            # start that just failed must not cost three seconds on the hot
+            # path: inside the throttle window, answer immediately.
+            if self._error and time.monotonic() - getattr(self, "_last_restart", 0.0) < 5.0:
+                return []
+            self._restart()
+        if not self.ready:
             return []
         if self.backend == "sidecar":
             rep = self._call({"op": "search", "query": query, "k": k})
@@ -451,7 +600,7 @@ class Embedder:
             rep = self._call({"op": "delete", "ids": ids}, timeout=10.0)
             return int(rep.get("deleted", 0)) if rep.get("ok") else 0
         try:
-            with self._conn() as c:
+            with contextlib.closing(self._conn()) as c:
                 for fid in ids:
                     c.execute("DELETE FROM vec WHERE fact_id=?", (fid,))
                 c.commit()

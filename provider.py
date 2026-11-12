@@ -12,12 +12,15 @@ because the block is pasted into the user message and reread on every following 
 from __future__ import annotations
 
 import json
-import os
-import time
 import logging
+import os
 import re
+import sqlite3
+import stat
 import threading
 import time
+import urllib.parse
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -32,7 +35,8 @@ log = logging.getLogger("carnet")
 
 GLYPH = "📓"
 
-# Tool schemas — four, no more: every schema is sent back on every turn.
+# Tool schemas: six, and each one is paid for on every turn. The note pair is
+# small on purpose: a note is written once and closed once.
 TOOLS = [
     {
         "name": "remember",
@@ -202,8 +206,9 @@ def extract(user_text: str) -> list[dict]:
         if not _self_contained(fragment, minimum) or len(fragment) > 500:
             return
         # Last gate: it must read as a sentence on its own, never as the tail of
-        # whatever surrounded it in the original message.
-        if looks_like_fragment(fragment, strict=True):
+        # whatever surrounded it in the original message. Same rule as the tool
+        # for a layer-1 fact (strict is reserved for a core seat).
+        if looks_like_fragment(fragment, strict=False):
             return
         output.append({"text": fragment, "confidence": confidence, "source": "user"})
 
@@ -217,6 +222,12 @@ def extract(user_text: str) -> list[dict]:
         _add(_first_sentence(m.group(1)), 10, "certain")
     if not output:
         for m in _RE_PREFERENCE.finditer(body):
+            lead = body[max(0, m.start() - 40):m.start()]
+            # Quoted prose, a pasted log or a bulleted list is not a preference:
+            # the speaker is reporting someone else's words, not stating a taste.
+            # No "and a colon" escape: `He wrote "I hate X"` is a quotation too.
+            if any(q in lead for q in ('"', "\u201c", "\u201d", "\u00ab", "\u00bb", ":", ">", "- ", "* ")):
+                continue
             _add(_first_sentence(m.group(1) + m.group(2)), 12, "probable")
     # internal deduplication
     seen, unique = set(), []
@@ -317,6 +328,95 @@ def _modern_args(args: dict) -> dict:
     return out
 
 
+def _canonical(path: str | Path) -> str:
+    """The same folder reached through a symlink is the same folder.
+
+    The clone check used to compare raw strings, so a home opened via a symlink
+    looked like a different home and the memory was wiped. Resolve both sides,
+    and never raise: a path that no longer exists still has to compare.
+    """
+    try:
+        resolved = str(Path(path).expanduser().resolve())
+    except (OSError, RuntimeError):
+        resolved = str(Path(path).expanduser().absolute())
+    # macOS APFS is case-insensitive by default: /Users/X and /users/x are the
+    # same folder. normcase folds them on the platforms that do that.
+    return os.path.normcase(resolved)
+
+
+def _db_id(path: str | Path) -> tuple[str, Optional[str]]:
+    """(state, identity) of another home's database.
+
+    state is "missing" when there is no database there, "unreadable" when one is
+    there but cannot be read (a writer holds it, a slow volume, a FIFO), and "ok"
+    when it was read — in which case the identity may still be None, because a
+    database written before this version has none.
+    """
+    target = Path(path).expanduser()
+    try:
+        info = target.lstat()
+    except OSError:
+        return ("missing", None)
+    # A FIFO or a device at that path would block the open for ever: rule it out
+    # before touching SQLite.
+    if not stat.S_ISREG(info.st_mode):
+        return ("unreadable", None)
+    try:
+        # "?" and "#" in a path break a SQLite URI and turn mode=ro into a create.
+        uri = "file:" + urllib.parse.quote(str(target)) + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+        try:
+            row = conn.execute("SELECT v FROM meta WHERE k='db_id'").fetchone()
+            return ("ok", str(row[0]).strip() if row and row[0] else None)
+        finally:
+            conn.close()
+    except (sqlite3.DatabaseError, OSError, ValueError):
+        return ("unreadable", None)
+
+
+def _home_marker(home: str | Path) -> Optional[str]:
+    """The identifier of a home, stored beside the database, not inside it.
+
+    It survives a quarantine of the database (which renames `carnet.db` aside),
+    so a home whose memory was set aside is still recognisable as itself.
+    """
+    try:
+        return ((Path(home).expanduser() / "carnet" / "home-id").read_text() or "").strip() or None
+    except OSError:
+        return None
+
+
+def _ensure_home_marker(home: str | Path) -> Optional[str]:
+    """Read the identifier of this home, creating it on first run."""
+    existing = _home_marker(home)
+    if existing:
+        return existing
+    value = uuid.uuid4().hex
+    try:
+        folder = Path(home).expanduser() / "carnet"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "home-id"
+        target.write_text(value + "\n")
+        os.chmod(target, 0o600)
+        return value
+    except OSError as exc:
+        log.warning("carnet: could not write the home identifier: %s", exc)
+        return None
+
+
+def _looks_like_home(path: str | Path) -> bool:
+    """Does this path still hold a Hermes home with a Carnet database?
+
+    Existence is not enough: a file, or an empty folder recreated later at the
+    same place, would make a *moved* profile look like a *copy* and empty it.
+    """
+    try:
+        root = Path(path).expanduser()
+        return root.is_dir() and (root / "carnet" / "carnet.db").exists()
+    except OSError:
+        return False
+
+
 class CarnetProvider(MemoryProvider):
     def __init__(self) -> None:
         self._root: Optional[Path] = None
@@ -330,6 +430,9 @@ class CarnetProvider(MemoryProvider):
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._worker = None
+        self._worker_gen = 0
+        self._drain_lock = threading.Lock()
         self._lock = threading.Lock()
         self._first_turn = True
         self._notes_seen_session = ""
@@ -341,6 +444,144 @@ class CarnetProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         return True
+
+    def _check_clone(self) -> None:
+        """A copied home must not inherit another agent's memories.
+
+        ``hermes profile create`` copies the whole home, memory database
+        included. When the stamped home still exists, this database is a copy:
+        the old file is set aside and a fresh one takes its place. When it is
+        gone, the profile was moved and the memory has to be kept. Paths are
+        compared after resolution, so the same home opened through a symlink is
+        not mistaken for a move.
+        """
+        try:
+            store = self._store
+            if store is None:                  # initialize() sets it first
+                return
+            stamped = store.meta_get("profile_home", "")
+            here = _canonical(self._home or "")
+            if not stamped:
+                _ensure_home_marker(self._home or "")
+                store.meta_set("profile_home", here)
+                # A database that already holds facts but has lost its stamp is
+                # not a fresh profile: it was copied, or it is old enough to
+                # predate the stamp. Adopting it silently is what the check
+                # exists to prevent, so it is at least flagged.
+                if store.count()["facts"] > 0:
+                    store.meta_set("clone_suspect", "unknown origin")
+                    log.warning("carnet: this memory has %d facts but no recorded "
+                                "origin; adopting it and flagging it",
+                                store.count()["facts"])
+            elif _canonical(stamped) != here:
+                if self._is_copy_of(stamped):
+                    self._quarantine_memory(stamped)
+                else:
+                    log.info("carnet: database moved from %s to %s, memory kept", stamped, here)
+                    store.meta_set("profile_home", here)
+        except Exception as exc:
+            log.warning("carnet: clone check failed: %s", exc)
+
+    def _is_copy_of(self, origin: str) -> bool:
+        """Is this database a copy of the memory that lives at `origin`?
+
+        The database carries its own identity, written once, and it travels with
+        a copy as well as with a move. So the question is not "does that folder
+        still exist" but "does the file over there have the same identity as
+        mine": yes means this file is a copy of it, whatever the folders look
+        like. A home identifier is a second witness, for databases written before
+        this version and for an origin whose database was renamed aside.
+
+        When both sides are identifiable and disagree, this file is not a copy of
+        what sits there now. It may still hold a profile deleted since, and
+        erasing it would destroy the only remaining copy: it is flagged instead.
+        """
+        ours = ""
+        try:
+            ours = self._store.meta_get("db_id", "") if self._store else ""
+        except Exception:
+            ours = ""
+        origin_db = Path(origin).expanduser() / "carnet" / "carnet.db"
+        state, theirs = _db_id(origin_db)
+        mine = _home_marker(self._home or "")
+        other = _home_marker(origin)
+        if ours and theirs and ours == theirs:
+            return True
+        if mine and other and mine == other:
+            return True
+        if state == "unreadable":
+            # The database is there but we could not read it (a writer holds it,
+            # a slow volume). Not knowing is not the same as knowing it differs:
+            # set the copy aside, which is reversible, rather than adopt another
+            # profile's memory because the check happened to be unlucky.
+            log.warning("carnet: could not read the identity of %s; treating this "
+                        "memory as a copy and setting it aside", origin_db)
+            return True
+        if (ours or mine) and (theirs or other):
+            self._flag_clone_suspect(origin)
+            return False
+        return _looks_like_home(origin)
+
+    def _flag_clone_suspect(self, origin: str) -> None:
+        try:
+            if self._store:
+                self._store.meta_set("clone_suspect", str(origin))
+        except Exception:
+            pass
+        log.warning(
+            "carnet: %s holds a memory that did not come from the profile now "
+            "living at %s; keeping it and flagging it", self._home, origin)
+
+    def _quarantine_memory(self, origin: str) -> None:
+        """Set a copied database aside instead of erasing it.
+
+        The home it came from still exists, so this file holds another agent's
+        memories. Renaming it keeps the evidence: if the guess was wrong, nothing
+        is lost and the old file sits right there with a timestamp in its name.
+        """
+        root, store = self._root, self._store
+        if root is None or store is None:          # initialize() sets both first
+            log.warning("carnet: quarantine requested before initialization")
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate, n = stamp, 1
+        while (root / f"carnet-{candidate}.db").exists():   # never overwrite an aside file
+            n += 1
+            candidate = f"{stamp}-{n}"
+        stamp = candidate
+        try:
+            store.close()
+        except Exception:
+            pass
+        moved = False
+        for suffix in ("", "-wal", "-shm"):
+            source = root / f"carnet.db{suffix}"
+            if not source.exists():
+                continue
+            try:
+                source.rename(root / f"carnet-{stamp}.db{suffix}")
+                moved = moved or suffix == ""
+            except OSError as exc:
+                log.warning("carnet: could not set %s aside: %s", source.name, exc)
+        if not moved:
+            # The copy is still on disk: stamping it as ours would freeze another
+            # agent's memory in place and the check would never run again.
+            log.warning("carnet: keeping the copy in place, it will be re-checked next start")
+            self._store = Carnet(root)
+            self._store.init_schema()
+            return
+        # The injection journal holds another agent's queries: it is copied along
+        # with the database and must not stay either.
+        for name in ("injections.jsonl", "embed.log"):
+            try:
+                (root / name).unlink()
+            except OSError:
+                pass
+        self._store = Carnet(root)
+        self._store.init_schema()
+        self._store.meta_set("profile_home", _canonical(self._home or root))
+        log.info("carnet: database copied from %s, previous one kept as carnet-%s.db",
+                 origin, stamp)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         home = kwargs.get("hermes_home") or ""
@@ -358,40 +599,14 @@ class CarnetProvider(MemoryProvider):
         self._root = self._home / "carnet"
         self._store = Carnet(self._root)
         self._store.init_schema()
-        # `hermes profile create` copies the whole home, memory database
-        # included. A brand-new profile must not wake up with another agent's
-        # life: when the base was written by a different home that still exists,
-        # this is a copy, so it is emptied. If that home is gone, the profile was
-        # moved and the memory has to be kept.
-        try:
-            stamped = self._store.meta_get("profile_home", "")
-            here = str(self._home)
-            if not stamped:
-                self._store.meta_set("profile_home", here)
-            elif stamped != here:
-                if Path(stamped).exists():
-                    removed = self._store.reset_memory(reason=f"cloned from {stamped}")
-                    # The injection journal holds another agent's queries: it is
-                    # copied along with the database and must not stay either.
-                    for name in ("injections.jsonl", "embed.log"):
-                        try:
-                            (self._root / name).unlink()
-                        except OSError:
-                            pass
-                    log.info("carnet: database copied from %s, %d facts cleared for %s",
-                             stamped, removed, here)
-                else:
-                    log.info("carnet: database moved from %s to %s, memory kept", stamped, here)
-                self._store.meta_set("profile_home", here)
-        except Exception as exc:
-            log.warning("carnet: clone check failed: %s", exc)
+        self._check_clone()
         self._refresh_config()
         self._session_id = session_id or ""
         self._first_turn = True
         self._notes_seen_session = ""
         # Vectors: separate server, started in the background so the turn is never blocked.
         try:
-            server = Path(__file__).with_name("dev") / "embed_server.py"
+            server = Path(__file__).with_name("sidecar") / "embed_server.py"
             backend = str(self._config.get("embed_backend") or "lmstudio")
             model_dir = ""
             if backend == "sidecar":
@@ -403,8 +618,7 @@ class CarnetProvider(MemoryProvider):
                                       backend=backend,
                                       url=str(self._config.get("embed_url") or ""),
                                       model=str(self._config.get("embed_model") or ""),
-                                      api_key=_secret("CARNET_EMBED_API_KEY")
-                                      or str(self._config.get("embed_api_key") or ""),
+                                      api_key=_secret("CARNET_EMBED_API_KEY"),
                                       model_dir=model_dir)
             self._embedder.start_in_background()
         except Exception as exc:
@@ -449,7 +663,14 @@ class CarnetProvider(MemoryProvider):
         self._config = self._load_config()
         self._config_stamp = key
         if self._store:
-            self._store.meta_set("seat_limit", str(int(self._config["seat_limit"])))
+            # Persisting the seat limit is a convenience, not a condition: under
+            # a writer lock it must not abort the session. The in-memory config
+            # is already the right one.
+            try:
+                self._store.meta_set("seat_limit", str(int(self._config["seat_limit"])))
+            except sqlite3.OperationalError as exc:
+                log.warning("carnet: could not persist seat_limit (%s); using %s from config",
+                            exc, int(self._config["seat_limit"]))
 
     # -- layer 0: the core -------------------------------------------
     def system_prompt_block(self) -> str:
@@ -536,6 +757,22 @@ class CarnetProvider(MemoryProvider):
             tight = len(already) >= session_limit
             threshold = threshold * (1.6 if tight else 1.0)
 
+            # Eight 2 000-character notes are 16 000 characters: the block is
+            # capped to a third of the budget before anything else is counted.
+            note_room = max(0, budget // 3)
+            if len(notes_block) > note_room:
+                notes_block = notes_block[:note_room].rstrip() + "…"
+
+            # Everything that reaches the prompt is counted: the header, the
+            # health line and the notes block are part of the bill. They used to
+            # be appended after the accounting, which is how a 1 400-character
+            # budget ended up sending 15 000.
+            header_room = 90
+            health = self._health_line()
+            extras = [p for p in (notes_block, health) if p]
+            reserve = header_room + sum(len(p) + 2 for p in extras)
+            room = max(0, budget - reserve)
+
             kept, total, n_facts, n_sheets = [], 0, 0, 0
             for r in results:
                 row = r["row"]
@@ -562,22 +799,33 @@ class CarnetProvider(MemoryProvider):
                         continue
                     line = self._fact_line(row)
                     n_facts += 1
-                if total + len(line) > budget and kept:
-                    break
+                if total + len(line) > room:
+                    if kept:
+                        break
+                    # A single item larger than the whole budget. Clip the body,
+                    # never the pointer: the id and the read_fiche call are what
+                    # let the agent open the rest (R5).
+                    if room <= 0:
+                        break
+                    pointer = f" → read_fiche({row['id']})"
+                    keep_chars = room - len(pointer) - 2
+                    if keep_chars <= 0:
+                        line = pointer.strip()
+                    else:
+                        line = line[:keep_chars].rstrip() + "…" + pointer
                 kept.append((row["id"], line))
                 total += len(line)
 
             self._first_turn = False
             if not kept:
                 self._last_prefetch = []
-                parts = [p for p in (notes_block, self._health_line()) if p]
+                parts = [p for p in (notes_block, health) if p]
                 return "\n\n".join(parts)
 
             self._store.mark_injected(sid, [i for i, _ in kept])
             self._last_prefetch = [i for i, _ in kept]
             header = f"[memory · {len(kept)} new · {len(already)} already in context]"
             block = [header] + [l for _, l in kept]
-            health = self._health_line()
             if health:
                 block.append(health)
             if notes_block:
@@ -588,7 +836,9 @@ class CarnetProvider(MemoryProvider):
             return final_text
         except Exception as exc:  # never blocking, never silent
             log.warning("carnet: prefetch failed: %s", exc)
-            return ""
+            # Silence reads as "nothing to remember", which is a lie: say the
+            # channel is down so the model does not answer from an empty memory.
+            return "[memory · unavailable this turn]"
 
     def _candidates(self, query: str, *, semantic: bool = True) -> list[dict]:
         """Lexical + vector fusion. Each channel is brought onto a 0..1 scale,
@@ -651,6 +901,15 @@ class CarnetProvider(MemoryProvider):
                 "ts": _iso_now(), "session": sid, "query": (query or "")[:300],
                 "ids": ids, "chars": len(block), "block": block,
             }, ensure_ascii=False)
+            # Cap the journal: it is a debugging trace, not a record. Past 8 MB
+            # the oldest half is dropped, so a long-lived profile cannot fill
+            # the disk with turn transcripts.
+            try:
+                if p.exists() and p.stat().st_size > 8 * 1024 * 1024:
+                    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                    p.write_text("\n".join(lines[-4000:]) + "\n", encoding="utf-8")
+            except OSError:
+                pass
             with open(p, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
@@ -719,6 +978,11 @@ class CarnetProvider(MemoryProvider):
         pressure = self._store.meta_get("seat_pressure", "")
         if pressure:
             alerts.append("core full, 1 candidate waiting")
+        # A memory that may have been copied from another profile is not a
+        # detail to keep in the process log: the agent should know.
+        suspect = self._store.meta_get("clone_suspect", "")
+        if suspect:
+            alerts.append(f"memory may come from another profile ({suspect})")
         return f"[health · {' · '.join(alerts)}]" if alerts else ""
 
     def _health_line_only(self) -> str:
@@ -766,22 +1030,39 @@ class CarnetProvider(MemoryProvider):
 
     # -- worker ------------------------------------------------------
     def _start_worker(self) -> None:
-        if self._worker and self._worker.is_alive():
-            return
+        # A worker left over from a previous initialize() may still be finishing a
+        # drain. Clearing _stop for the new one would revive it: both would loop
+        # and both would drain the same queue. Each worker therefore carries a
+        # generation, and a worker that is no longer the current one leaves after
+        # its current pass.
+        self._worker_gen = getattr(self, "_worker_gen", 0) + 1
+        generation = self._worker_gen
+        old = self._worker
+        if old and old.is_alive():
+            self._stop.set()
+            self._wake.set()
+            old.join(timeout=2.0)
+            if old.is_alive():
+                log.info("carnet: previous worker still finishing; it will exit after this pass")
         self._stop.clear()
 
         def _loop():
-            while not self._stop.is_set():
+            while not self._stop.is_set() and self._worker_gen == generation:
                 self._wake.wait(timeout=5.0)
                 self._wake.clear()
-                if self._stop.is_set():
+                if self._stop.is_set() or self._worker_gen != generation:
                     break
                 try:
-                    self._drain()
+                    with self._drain_lock:
+                        self._drain()
                 except Exception as exc:
                     log.warning("carnet: worker: %s", exc)
 
         self._worker = spawn_context_thread(_loop, name="carnet-worker")
+        try:
+            self._worker.daemon = True      # a forgotten shutdown() must not hang exit
+        except (AttributeError, RuntimeError):
+            pass
         self._worker.start()
 
     def _drain(self) -> None:
@@ -1076,30 +1357,20 @@ class CarnetProvider(MemoryProvider):
                            "_change": ok}, ensure_ascii=False)
 
     # -- misc --------------------------------------------------------
-    def on_profile_created(self, profile_home: str = "", provider: str = "", **kwargs) -> None:
-        """Link the shared code into a new profile that uses carnet.
-
-        Hermes calls this hook when a profile is created. The profile keeps its
-        own data in ``<profile>/carnet/``; only the code is shared.
-        """
-        name = str(kwargs.get("provider") or kwargs.get("memory_provider") or provider or "")
-        if name and name != "carnet":
-            return
-        home = (profile_home or kwargs.get("hermes_home") or kwargs.get("profile")
-                or kwargs.get("path") or "")
-        if not home or not isinstance(home, (str, os.PathLike)):
-            log.warning("carnet: on_profile_created without a profile path")
-            return
-        try:
-            from .profiles import link_profile
-            result = link_profile(Path(home))
-            log.info("carnet: profile %s: %s", home, result["status"])
-        except Exception as exc:
-            log.warning("carnet: profile link failed for %s: %s", home, exc)
-
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
                           reset: bool = False, rewound: bool = False, **kwargs) -> None:
+        previous = self._session_id
         self._session_id = new_session_id or self._session_id
+        if reset or rewound:
+            # The conversation was rewound past the block that carried these
+            # facts: they are no longer in context, so they must be injectable
+            # again. Keeping the journal would silently starve the new branch.
+            try:
+                if self._store:
+                    self._store.forget_injections(self._session_id or previous)
+            except Exception as exc:
+                log.warning("carnet: could not reset injections after a rewind: %s", exc)
+            self._last_prefetch = []
         self._first_turn = True
         self._notes_seen_session = ""
 

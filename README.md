@@ -1,10 +1,11 @@
 # Carnet
 
-**Memory that stays cheap while it grows.**
+**Memory that grows without growing your context.**
 
-Carnet is a memory plugin for [Hermes Agent](https://hermes-agent.nousresearch.com). It has no
-server, needs no API key, and adds no dependency on the hot path: one SQLite
-file, a hard token budget per turn, and a memory graph inside the app.
+Carnet is a memory plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
+The point is not that it stores a lot: it is that the block injected into the
+prompt is capped, so turn 900 costs about what turn 9 cost. One SQLite file, no
+server, no API key, and a memory graph inside the app.
 
 `MIT` · `Hermes >= 0.23` · `Python 3.11+` · `macOS, Linux`
 
@@ -23,12 +24,17 @@ point at one fact, read it, correct it, and forget it.
 
 ## What makes it different
 
+- **Bounded context.** The injected block has a character budget it cannot
+  exceed, notes and status line included. The memory can grow for months while
+  the context stays flat, and the ceiling is a number you set, not a hope.
+- **Four layers, one of them small on purpose.** A core of 20 seats always in
+  the prompt, facts recalled only when the turn makes them relevant, sheets read
+  on demand, notes that expire by themselves. Promotion into the core is a
+  decision, not an accident.
 - **Native to Hermes.** A real page in the desktop app, a real memory provider in
   the agent. No browser tab, no companion service, no scraping.
 - **Lightweight.** The hot path is the Python standard library and one SQLite
   file. No vector database, no daemon required to start.
-- **Bounded context.** The injected block has a character budget it cannot
-  exceed. The memory can grow for months while the context stays flat.
 - **Nearly unlimited.** Facts cost nothing while they sit still. They are read
   only when the conversation makes them relevant.
 - **Precise.** Every fact has an id, a confidence, a date, a source. Each one is
@@ -49,7 +55,7 @@ Paste this into a Hermes session:
 > `~/.hermes/desktop-plugins/carnet/plugin.js`, enable the plugin, and set
 > `memory.provider` to `carnet`.
 
-The agent does the six commands for you and tells you when to restart.
+The agent runs these commands for you and tells you when to restart.
 
 ### 2. From a terminal
 
@@ -162,7 +168,7 @@ answers with its best guess.
 | `recall_floor` | 0.34 | Below this coverage, `recall` answers "nothing relevant" |
 | `notes_enabled` | `false` | Temporary notes layer |
 | `max_notes` / `expiry_days` | 8 / 7 | Active notes and their lifetime |
-| `embed_backend` | `lmstudio` | `disabled`, `lmstudio`, `local`, `custom` |
+| `embed_backend` | `lmstudio` | `disabled`, `lmstudio`, `sidecar` (the page calls it *local*), `custom` |
 | `model_mode` | `off` | Optional small model that rewrites facts more cleanly |
 
 All of them are in the app, under Carnet > Settings, and in
@@ -197,12 +203,15 @@ Everything a user should know before installing:
 - **One background process, only in `local` mode.** A Python sidecar holds the
   ONNX model in memory, is shared by every session, and is released after 30
   minutes of inactivity or when the machine runs short on memory.
-- **Credentials through Hermes.** The only secret the plugin can use is an
-  endpoint key, declared as `CARNET_EMBED_API_KEY` and read with
-  `agent.secret_scope`, so a key never leaks across profiles.
-- **Data stays in `$HERMES_HOME/carnet/`.** The plugin reads no file outside its
-  own folder, except the shared model cache.
-- **The memory is yours to read.** It is a SQLite file; `sqlite3 carnet.db` works.
+- **Credentials through Hermes.** Two secrets at most: `CARNET_EMBED_API_KEY` and
+  `CARNET_MODEL_API_KEY`, both declared in the manifest and read with
+  `agent.secret_scope`, so a key never leaks across profiles and is never written
+  to a config file.
+- **What the plugin reads.** Its own data lives in `$HERMES_HOME/carnet/`; it also
+  reads `$HERMES_HOME/config/carnet.json` (shared settings), the shared model
+  cache under `$HERMES_HOME/cache/carnet/` when the local backend is on, and the
+  profile's `config.yaml` to follow the interface language. Nothing else.
+- **The memory is yours to read.** The memory is one SQLite file; `sqlite3 carnet.db` works.
 
 ---
 
@@ -212,15 +221,19 @@ The code and the embedding model are shared by the whole Hermes installation;
 the memory is not. Each profile has its own database at
 `$HERMES_HOME/carnet/carnet.db`.
 
-Installing the plugin in a second profile means a symlink to a single copy, not
-a second clone: two physical copies of the same plugin make `uv lock` fail with
-a duplicate workspace member.
+Each profile installs the plugin itself:
+
+```bash
+hermes -p <profile> plugins install 404BugX/carnet
+```
 
 Creating a profile by copying your home copies the database with it. Carnet
-detects that case, on the first start of the new profile, and empties the copy so
-a new agent does not answer with someone else's memories. A profile that was
-*moved* keeps its memory: the check looks at whether the original home still
-exists.
+detects that case, on the first start of the new profile, and sets the copied
+database aside as `carnet-<timestamp>.db`, so a new agent does not answer with
+someone else's memories and nothing is destroyed if the guess was wrong. A
+profile that was *moved* keeps its memory: the check looks at whether the
+original home still exists, and compares resolved paths, so the same home opened
+through a symlink is not mistaken for a move.
 
 ---
 
@@ -230,7 +243,7 @@ exists.
 plugin.yaml          manifest: tools, hooks, compatibility
 provider.py          the MemoryProvider: injection, tools, budgets
 store.py             SQLite: schema, migrations, search, notes
-embedder.py          optional vectors: three backends, keep-alive
+embedder.py          optional vectors: four backends, keep-alive
 rephrase.py          optional small model that tidies a fact
 watch.py             background pass over the session queue
 dashboard/           the page's HTTP layer
@@ -250,9 +263,11 @@ Desktop plugin SDK, which is also what makes it survive a Hermes update.
 python3 -m unittest discover -s tests
 ```
 
-The suite needs no Hermes install, no network and no model: it covers the schema
-migrations, the note lifecycle, the memory reset used when a profile was copied,
-and the meaning of the score `recall` reports.
+The suite needs no network and no model, and it never touches your real home: it
+covers the schema migrations, the note lifecycle, the clone check that sets a
+copied database aside, and the meaning of the score `recall` reports. One of its
+module imports Hermes' provider base, so run it from a Hermes checkout or point
+`CARNET_HERMES_AGENT` at one; they skip themselves otherwise.
 
 ---
 

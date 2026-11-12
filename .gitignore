@@ -38,7 +38,8 @@ models/
 .idea/
 .vscode/
 
-# Dev-only tooling: local scratch, never committed
+# Dev-only tooling: local scratch, never committed.
+# The sidecar is shipped (the local embedding backend runs it): see sidecar/.
 carnet/dev/
 dev/
 

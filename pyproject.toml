@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carnet"
-version = "0.9.1"
+version = "0.9.5"
 description = "Four-layer memory provider for Hermes: permanent core, facts recalled on demand, sheets read only when needed."
 readme = "README.md"
 license = { text = "MIT" }
@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 # The default backend talks to LM Studio and needs nothing beyond the stdlib.
-# The `sidecar` backend runs dev/embed_server.py in a separate interpreter and
+# The `sidecar` backend runs sidecar/embed_server.py in a separate interpreter and
 # needs these two packages there. Hermes installs the declared dependencies when
 # the plugin is admitted; install the extra for that fallback:
 #   pip install "carnet[sidecar]"
@@ -33,5 +33,5 @@ carnet = [
   "locales/*.yaml",
   "dashboard/*",
   "desktop/*",
-  "dev/embed_server.py",
+  "sidecar/embed_server.py",
 ]

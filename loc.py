@@ -29,7 +29,18 @@ _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    """Resolve the Hermes home on every call.
+
+    The gateway can switch profiles at runtime, so a constant resolved at import
+    time freezes whichever home happened to be active first. ``hermes_constants``
+    is the only source that knows about that switch.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
 
 def _scalar(raw: str) -> str:

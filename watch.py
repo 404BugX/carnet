@@ -15,7 +15,6 @@ No extra process: LM Studio is already running for embeddings.
 import hashlib
 import importlib.util
 import json
-import re
 import sys
 import urllib.request
 from array import array
@@ -311,6 +310,13 @@ def propose(store, url: str = DEFAULT_URL, model: str = DEFAULT_MODEL,
 
 
 # ------------------------------------------------------------------ applying
+def _status(row) -> str:
+    """sqlite3.Row has no .get(): read the column, default to active."""
+    try:
+        return str(row["status"] or "active")
+    except (IndexError, KeyError):
+        return "active"
+
 def apply(store, pid: str, keep: str = "a") -> dict:
     p = store.conn.execute("SELECT * FROM propositions WHERE id=?", (pid,)).fetchone()
     if not p:
@@ -322,6 +328,13 @@ def apply(store, pid: str, keep: str = "a") -> dict:
     b = store.fact(p["fact_b"]) if p["fact_b"] else None
     if not a or not b:
         return {"ok": False, "error": "original fact disappeared"}
+    # A fact that was removed since the proposal was written must not be
+    # "merged": replace_fact refuses an inactive source, and removing the other
+    # one anyway would empty the memory and report success.
+    if _status(a) != "active":
+        return {"ok": False, "error": "the kept fact is no longer active"}
+    if _status(b) != "active":
+        return {"ok": False, "error": "the other fact is no longer active"}
 
     if p["type"] == "duplicate":
         if not p["text"]:
@@ -331,6 +344,8 @@ def apply(store, pid: str, keep: str = "a") -> dict:
             importance=min(int(a["importance"]), int(b["importance"])),
             confidence=a["confidence"], source="watch",
         )
+        if new.get("error") or not new.get("id"):
+            return {"ok": False, "error": str(new.get("error") or "the merge produced no fact")}
         store.remove_fact(b["id"], f"merged into {new['id']}")
         store.conn.execute("UPDATE facts SET replaced_by=? WHERE id=?", (new["id"], b["id"]))
         store.conn.commit()

@@ -23,16 +23,48 @@ from array import array
 from operator import mul
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------ loading
 _ROOT = Path(__file__).resolve().parent.parent      # …/plugins/carnet
-_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
-_FOLDER = _HOME / "carnet"
-_DB = _FOLDER / "carnet.db"
+
+
+def _hermes_home() -> Path:
+    """Resolve the Hermes home on every call.
+
+    This module is loaded flat by the gateway, so it cannot import the package's
+    own helpers; and the gateway can switch profile while it runs, so a constant
+    resolved at import time would freeze the first home and serve another
+    profile's folder.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+SECRET_KEYS = ("embed_api_key", "model_api_key")
+
+
+def _secret(name: str) -> str:
+    """Read a credential from the agent's secret scope.
+
+    Keys never live in ``config/carnet.json``: that file is plaintext, world
+    readable, and copied with the profile. The gateway resolves the ones declared
+    in ``config_schema`` from the profile environment.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "")
+    except Exception:
+        return ""
+
 
 def _load(name: str, file: Path):
     """Load a sibling module by path: the gateway imports this file "flat",
@@ -80,7 +112,7 @@ def _rephrase():
 
 # Import trace: proof that the gateway mounted this backend (diagnostic).
 try:
-    _trace = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "logs/carnet-api-import.log"
+    _trace = _hermes_home() / "logs/carnet-api-import.log"
     with open(_trace, "a", encoding="utf-8") as _f:
         _f.write(f"{__import__('datetime').datetime.now().isoformat()} imported from {_ROOT}\n")
 except Exception:
@@ -204,10 +236,13 @@ def _write_runtime_config(values: dict) -> None:
                 data = loaded
         except (OSError, ValueError):
             data = {}
+    values = {k: v for k, v in values.items() if k not in SECRET_KEYS}
+    for key in SECRET_KEYS:            # scrub what an older version wrote here
+        data.pop(key, None)
     data.update(values)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    # The file can hold an endpoint key: keep it readable by its owner only.
+    # Keep the file readable by its owner only: it holds endpoint settings.
     try:
         path.chmod(0o600)
     except OSError:
@@ -237,8 +272,8 @@ def _embedding_payload() -> dict:
         "mode": _embedding_mode(cfg),
         "url": _clean_setting(cfg.get("embed_url")),
         "model": _clean_setting(cfg.get("embed_model")),
-        "api_key_set": bool(str(cfg.get("embed_api_key") or "").strip()),
-        "local": localmodel.status(_HOME),
+        "api_key_set": bool(_secret("CARNET_EMBED_API_KEY").strip()),
+        "local": localmodel.status(_hermes_home()),
     }
 
 
@@ -283,8 +318,9 @@ def set_embedding(setting: EmbeddingSetting) -> dict:
         values.update(embed_backend="custom", embed_url=url, embed_model=model)
     else:
         values["embed_backend"] = "sidecar"
-    if setting.api_key is not None:
-        values["embed_api_key"] = setting.api_key.strip()
+    if (setting.api_key or "").strip():
+        raise HTTPException(400, "set CARNET_EMBED_API_KEY in the profile environment; "
+                                 "keys are not stored by the plugin")
     _write_runtime_config(values)
     return _embedding_payload()
 
@@ -293,7 +329,7 @@ def set_embedding(setting: EmbeddingSetting) -> dict:
 def download_embedding(consent: DownloadConsent) -> dict:
     if not consent.consent:
         raise HTTPException(400, loc_mod.translate("errors.embedding_consent"))
-    return localmodel.start_download(_HOME)
+    return localmodel.start_download(_hermes_home())
 
 
 # ------------------------------------------------------------------ memory settings
@@ -301,6 +337,29 @@ MEMORY_STEPS = {
     key: (0.01 if key in getattr(store, "FLOAT_KEYS", {"abstention_threshold"}) else 1)
     for key in store.MEMORY_KEYS
 }
+
+
+def _scrub_secrets() -> None:
+    """Remove credentials an older version wrote into the shared config file.
+
+    Called from the two settings payloads: the file is read there anyway, and
+    rewriting it only when it actually holds a key keeps this side-effect free
+    in the normal case.
+    """
+    for path in (loc_mod.config_path(), _folder() / "config.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not any(k in data for k in SECRET_KEYS):
+            continue
+        for key in SECRET_KEYS:
+            data.pop(key, None)
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8")
+        except OSError:
+            pass
 
 
 def _global_config() -> dict:
@@ -316,6 +375,9 @@ def _global_config() -> dict:
 def _write_global_config(values: dict, remove: tuple = ()) -> None:
     path = loc_mod.config_path()
     data = _global_config()
+    values = {k: v for k, v in values.items() if k not in SECRET_KEYS}
+    for key in SECRET_KEYS:          # scrub what an older version wrote
+        data.pop(key, None)
     data.update(values)
     for key in remove:
         data.pop(key, None)
@@ -371,7 +433,13 @@ def set_memory(setting: MemorySetting) -> dict:
         if not low <= number <= high:
             raise HTTPException(400, loc_mod.translate(
                 "errors.setting_range", field=key, min=low, max=high))
-        values[key] = round(number, 2) if key == "abstention_threshold" else int(round(number))
+        # Every float setting keeps its decimals: rounding them to integers is
+        # how a documented 0.34 floor became 0.0 and silently disabled the
+        # "nothing relevant" guarantee.
+        if key in getattr(store, "FLOAT_KEYS", {"abstention_threshold"}):
+            values[key] = round(number, 3)
+        else:
+            values[key] = int(round(number))
     if not values:
         raise HTTPException(400, loc_mod.translate("errors.setting_empty"))
     _write_global_config(values)
@@ -396,7 +464,7 @@ def _model_values() -> dict:
         "mode": mode if mode in MODEL_MODES else "off",
         "url": str(data.get("model_url") or ""),
         "model": str(data.get("model_name") or ""),
-        "api_key": str(data.get("model_api_key") or ""),
+        "api_key": _secret("CARNET_MODEL_API_KEY"),
     }
 
 
@@ -450,6 +518,12 @@ def model_settings() -> dict:
     return _model_payload()
 
 
+@router.post("/model/verify")
+def model_verify() -> dict:
+    """Hash the local model on demand: sizes alone prove nothing."""
+    return localmodel.verify(_hermes_home())
+
+
 @router.post("/settings/model")
 def set_model(setting: ModelSetting) -> dict:
     mode = (setting.mode or "").strip().lower()
@@ -466,8 +540,9 @@ def set_model(setting: ModelSetting) -> dict:
         if not model:
             raise HTTPException(400, loc_mod.translate("errors.embedding_model"))
         values.update(model_url=url, model_name=model)
-    if setting.api_key is not None:
-        values["model_api_key"] = setting.api_key.strip()
+    if (setting.api_key or "").strip():
+        raise HTTPException(400, "set CARNET_MODEL_API_KEY in the profile environment; "
+                                 "keys are not stored by the plugin")
     _write_global_config(values)
     return _model_payload()
 
@@ -587,7 +662,7 @@ def _folder() -> Path:
     another agent's memories as if they were its own, which is exactly the kind
     of mistake a memory must never make. Each profile reads its own home.
     """
-    return _HOME / "carnet"
+    return _hermes_home() / "carnet"
 
 
 def _base():
@@ -625,8 +700,11 @@ def facts(q: str = "", status: str = "active", importance: str = "",
         where.append("status = ?")
         args.append(status)
     if importance != "":
+        try:
+            args.append(int(importance))
+        except (TypeError, ValueError):
+            raise HTTPException(400, loc_mod.translate("errors.bad_importance"))
         where.append("importance = ?")
-        args.append(int(importance))
     query = q.strip()
     if query and re.fullmatch(r"f-[0-9a-f]{2,8}", query.lower()):
         # An identifier is not text: it is looked up as is, prefix accepted.
@@ -700,19 +778,47 @@ def edit(fid: str, e: Edit) -> dict:
         fields["text"] = fields["text"].strip()
         if not fields["text"]:
             raise HTTPException(400, loc_mod.translate("errors.empty_text"))
+        # The same layer limit the agent gets: a fact edited from the page must
+        # not be able to store 800 characters that the prompt will truncate.
+        layer = int(fields.get("importance", r["importance"]))
+        if layer < 2:
+            key = "seat_char_limit" if layer == 0 else "fact_char_limit"
+            limit = int(_memory_values()[key])
+            if len(fields["text"]) > limit:
+                raise HTTPException(400, loc_mod.translate(
+                    "errors.text_too_long", limit=limit))
         fields["text_hash"] = store.fingerprint(fields["text"])
         fields["size"] = len(fields["text"])
+    wants_seat = fields.get("importance") == 0 and int(r["importance"]) != 0
+    if wants_seat:
+        # A seat is granted by promote(), never by a column update: otherwise the
+        # page can create a 26th core fact that the prompt will never show.
+        fields.pop("importance")
     fields["updated_at"] = store._now()
     sets = ", ".join(f"{k} = ?" for k in fields)
+    # One transaction for the edit and the promotion: a refused seat must leave
+    # nothing behind, otherwise a 409 is a lie about a text that did change.
+    c.conn.execute("BEGIN IMMEDIATE")
     try:
         c.conn.execute(f"UPDATE facts SET {sets} WHERE id = ?", list(fields.values()) + [fid])
-        c.conn.commit()
+        if wants_seat:
+            seat = c.promote(fid, limit=int(_memory_values()["seat_limit"]))
+            if not seat.get("seat"):
+                c.conn.execute("ROLLBACK")
+                raise HTTPException(409, loc_mod.translate(
+                    "errors.seats_full", free=seat.get("free", 0)))
+        c.conn.execute("COMMIT")
     except sqlite3.IntegrityError as exc:
         # facts_hash is UNIQUE (text_hash, valid_from): returning a duplicate
         # must read clearly, not surface as a 500.
-        c.conn.rollback()
+        c.conn.execute("ROLLBACK")
         if "UNIQUE" in str(exc).upper():
             raise HTTPException(409, loc_mod.translate("errors.duplicate_fact"))
+        raise HTTPException(400, loc_mod.translate("errors.write_refused", error=exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        c.conn.execute("ROLLBACK")
         raise HTTPException(400, loc_mod.translate("errors.write_refused", error=exc))
     # The text changed: the vector is worthless. Removing it is enough — the
     # plugin worker reindexes everything that has no vector.
@@ -751,7 +857,7 @@ def rephrase_fact(fid: str) -> dict:
     if not r:
         raise HTTPException(404, loc_mod.translate("errors.fact_not_found"))
     cfg = _model_values()
-    if cfg["mode"] != "custom":
+    if cfg["mode"] not in ("custom", "lmstudio"):
         return {"id": fid, "disabled": True, "reason": "model_off"}
     mod = _rephrase()
     chosen = cfg["model"]
@@ -780,6 +886,8 @@ def rephrase_fact(fid: str) -> dict:
 @router.post("/facts/{fid}/promote")
 def promote(fid: str) -> dict:
     c = _base()
+    if not c.fact(fid):
+        raise HTTPException(404, loc_mod.translate("errors.fact_not_found"))
     res = c.promote(fid, limit=int(_memory_values()["seat_limit"]))
     c.log("dashboard", "promotion", fid, res)
     return res
@@ -940,7 +1048,7 @@ def scan() -> dict:
     """Find suspicious pairs and have the missing proposals written."""
     c = _base()
     cfg = _model_values()
-    if cfg["mode"] != "custom":
+    if cfg["mode"] not in ("custom", "lmstudio"):
         return {"disabled": True, "proposals": 0, "skipped": 0, "failures": 0,
                 "candidates": 0, "pending": len(_watch().list_proposals(c, "pending"))}
     res = _watch().propose(c, url=cfg["url"], model=cfg["model"],
@@ -963,7 +1071,7 @@ def reject(pid: str) -> dict:
 @router.post("/proposals/{pid}/regenerate")
 def regenerate(pid: str) -> dict:
     cfg = _model_values()
-    if cfg["mode"] != "custom":
+    if cfg["mode"] not in ("custom", "lmstudio"):
         return {"ok": False, "disabled": True}
     return _watch().regenerate(_base(), pid, url=cfg["url"], model=cfg["model"],
                                api_key=cfg["api_key"], wait=False)
@@ -1304,7 +1412,12 @@ def graph(refresh: int = 0, influence: float = 0.5):
     database does not move, and `?refresh=1` forces the recomputation.
     """
     db = _folder() / "carnet.db"
-    key = (_db_stamp(db), refresh, round(max(0.0, min(1.0, influence)), 3))
+    # The path is part of the key: the gateway keeps this module loaded across
+    # profile switches, and two profiles can have databases of the same size and
+    # mtime (a copy keeps both), so the stamp alone served another profile's
+    # memories.
+    key = (str(Path(db).resolve()), _db_stamp(db), refresh,
+           round(max(0.0, min(1.0, influence)), 3))
     if not refresh and _GRAPH_CACHE["key"] == key and _GRAPH_CACHE["value"] is not None:
         return _GRAPH_CACHE["value"]
     value = _graph(influence)
@@ -1337,3 +1450,11 @@ def node(node_id: str):
         "confidence": d.get("confidence"),
         "status": d.get("status"),
     }
+
+
+# One migration pass at load: a credential an older version wrote into the
+# shared config is removed before any route can serve it.
+try:
+    _scrub_secrets()
+except Exception:      # never block the plugin on a migration
+    pass

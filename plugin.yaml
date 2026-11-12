@@ -1,5 +1,5 @@
 name: carnet
-version: 0.9.1
+version: 0.9.5
 manifest_version: 2
 api_version: 1
 license: MIT
@@ -24,10 +24,13 @@ hooks:
   - sync_turn
   - on_pre_compress
   - on_session_switch
-  - on_profile_created
   - recall_status
 config_schema:
   embed_api_key:
     type: secret
     env: CARNET_EMBED_API_KEY
     description: "Only needed for a custom embedding endpoint. A local server needs no key."
+  model_api_key:
+    type: secret
+    env: CARNET_MODEL_API_KEY
+    description: "Only needed when the rewrite model runs on a remote endpoint that asks for a key."
